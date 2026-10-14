@@ -1,0 +1,9 @@
+# CANsight 固件工程忽略规则
+# 编译产物（cmake/ninja 生成，不进版本库）
+build
+# CubeMX 临时文件
+mx.scratch
+# 保留 ST 扩展的工程元数据（不忽略）
+!.settings
+# VS Code 本地配置（含本机绝对路径，不提交）
+.vscode/
