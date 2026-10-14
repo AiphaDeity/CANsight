@@ -24,7 +24,7 @@
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
-
+#include "stdio.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -91,7 +91,9 @@ int main(void)
   MX_CAN1_Init();
   MX_USART6_UART_Init();
   /* USER CODE BEGIN 2 */
+  printf("=====CAN Sight Start=====\r\n");
 
+  
   /* USER CODE END 2 */
 
   /* Infinite loop */
@@ -151,7 +153,12 @@ void SystemClock_Config(void)
 }
 
 /* USER CODE BEGIN 4 */
-
+int __io_putchar(int ch)
+{
+  uint8_t byte = (uint8_t)ch;
+  HAL_UART_Transmit(&huart6, &byte, 1, HAL_MAX_DELAY);
+  return ch;
+}
 /* USER CODE END 4 */
 
 /**
