@@ -19,9 +19,9 @@
 /* Includes ------------------------------------------------------------------*/
 #include "main.h"
 #include "can.h"
-#include "gpio.h"
-#include "stm32_hal_legacy.h"
+#include "tim.h"
 #include "usart.h"
+#include "gpio.h"
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
@@ -30,12 +30,23 @@
 
 /* Private typedef -----------------------------------------------------------*/
 /* USER CODE BEGIN PTD */
-
+// 软件队列里保存的单帧 CAN 报文
+typedef struct {
+  uint32_t timestamp_us; // 收到报文时的系统微秒计数
+  uint32_t id;           // 标准帧或者扩展帧ID
+  uint8_t ide;           // CAN_ID_STD：标准帧；CAN_ID_EXT：扩展帧
+  uint8_t rtr;     // CAN_RTR_DATA：数据帧；CAN_RTR_REMOTE：远程帧
+  uint8_t dlc;     // 数据长度,经典CAN范围是0~8
+  uint8_t data[8]; // 报文数据，
+} CanFrame;
 /* USER CODE END PTD */
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
+// 队列大小
+#define CAN_RX_QUEUE_SIZE 64U
 
+#define CAN_RX_QUEUE_MASK (CAN_RX_QUEUE_SIZE - 1U) // 掩码，用于循环队列索引
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -47,17 +58,24 @@
 
 /* USER CODE BEGIN PV */
 
-/* CAN发送报文头、数据和发送邮箱*/
-static CAN_TxHeaderTypeDef txHeader;
-static uint8_t txData[8];
-static uint32_t txMailbox;
+// 保存 CAN 接收报文的环形队列
+static CanFrame canRxQueue[CAN_RX_QUEUE_SIZE];
 
-static CAN_RxHeaderTypeDef rxHeader;
-static uint8_t rxData[8];
-static volatile uint8_t rxPending = 0; // 中断和主循环共享，防编译器优化
+// head 是中断的写入位置；tail 是主循环的读取位置
+static volatile uint8_t canRxQueueHead = 0U;
+static volatile uint8_t canRxQueueTail = 0U;
 
-/*每成功发送一帧后递增，用于确认报文连续变化*/
-static uint8_t txSequence;
+// 软件队列满时，无法入队的报文数量
+static volatile uint32_t canRxQueueOverflow = 0U;
+
+//成功从CAN硬件FIFO0取出的帧数
+static volatile uint32_t canRxFramesReadFromFifo = 0U;
+
+//CAN硬件FIFO0溢出的事件数
+static volatile uint32_t canRxFifo0OverrunEvents = 0U;
+
+//HAL 报告过的 CAN 错误位集合，便于调试时查看
+static volatile uint32_t canHalErrorFlags = 0U;
 
 /* USER CODE END PV */
 
@@ -70,13 +88,69 @@ void SystemClock_Config(void);
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
 
+/*
+生产者函数：由 CAN 接收中断调用
+把一帧复制进队列；队列满时立即返回，不等待主循环
+*/
+static uint8_t CAN_RxQueue_PushFromISR(const CanFrame *frame) {
+  uint32_t head = canRxQueueHead;
+
+  // 计算下一个写入位置
+  uint32_t nextHead = (head + 1U) & CAN_RX_QUEUE_MASK;
+
+  // 检查队列是否已满
+  if (nextHead == canRxQueueTail) {
+    // 队列已满，无法入队
+    canRxQueueOverflow++;
+    return 0U; // 入队失败
+  }
+
+  // 将报文复制到队列中
+  canRxQueue[head] = *frame;
+
+  // 确保帧内容先写完，再发布新的 head 索引，防止主循环读取到不完整的帧
+  __DMB(); // 数据同步屏障，确保内存访问顺序
+
+  canRxQueueHead = nextHead; // 更新 head 索引，表示新帧已入队
+
+  return 1U;
+}
+
+/*
+消费者函数：由主循环调用
+从队列中取出一帧；队列空时立即返回，不等待中断
+*/
+static uint8_t CAN_RxQueue_Pop(CanFrame *frame) {
+  uint32_t tail = canRxQueueTail;
+
+  // 检查队列是否为空
+  if (tail == canRxQueueHead) {
+    // 队列为空，无法出队
+    return 0U; // 出队失败
+  }
+
+  // 确保读取到生产者已经写入的队列内容
+  __DMB();
+
+  // 把队列槽位复制到主循环自己的变量
+  *frame = canRxQueue[tail];
+
+  // 复制完成后，移动 tail，释放这个槽位给生产者
+  __DMB(); // 数据同步屏障，确保内存访问顺序
+
+  canRxQueueTail = (tail + 1U) & CAN_RX_QUEUE_MASK; // 更新 tail 索引
+
+  return 1U; // 出队成功
+}
+
 /* USER CODE END 0 */
 
 /**
- * @brief  The application entry point.
- * @retval int
- */
-int main(void) {
+  * @brief  The application entry point.
+  * @retval int
+  */
+int main(void)
+{
 
   /* USER CODE BEGIN 1 */
 
@@ -84,8 +158,7 @@ int main(void) {
 
   /* MCU Configuration--------------------------------------------------------*/
 
-  /* Reset of all peripherals, Initializes the Flash interface and the Systick.
-   */
+  /* Reset of all peripherals, Initializes the Flash interface and the Systick. */
   HAL_Init();
 
   /* USER CODE BEGIN Init */
@@ -103,7 +176,13 @@ int main(void) {
   MX_GPIO_Init();
   MX_CAN1_Init();
   MX_USART6_UART_Init();
+  MX_TIM2_Init();
   /* USER CODE BEGIN 2 */
+
+  if(HAL_TIM_Base_Start(&htim2) != HAL_OK)
+  {
+    Error_Handler();
+  }
 
   /*CAN1过滤器配置，ID和Mask都设为0，表示接收所有符合格式的报文。*/
   CAN_FilterTypeDef canFilter = {0};
@@ -120,6 +199,9 @@ int main(void) {
   canFilter.FilterActivation = ENABLE;               // 启用过滤器
   canFilter.SlaveStartFilterBank = 14; // CAN1/CAN2 共用过滤器的分界值
 
+  //收到报文时通知：FIFO0溢出时也通知
+  uint32_t canNotifications = CAN_IT_RX_FIFO0_MSG_PENDING | CAN_IT_RX_FIFO0_OVERRUN;
+
   /* 将过滤器配置写入 CAN1 */
   if (HAL_CAN_ConfigFilter(&hcan1, &canFilter) != HAL_OK) {
     /* 过滤器配置失败，进入错误处理 */
@@ -132,19 +214,11 @@ int main(void) {
     Error_Handler();
   }
 
-  if (HAL_CAN_ActivateNotification(&hcan1, CAN_IT_RX_FIFO0_MSG_PENDING) !=
+  if (HAL_CAN_ActivateNotification(&hcan1, canNotifications) !=
       HAL_OK) {
     /* 激活中断失败，进入错误处理 */
     Error_Handler();
   }
-
-  /*设置要发送的CAN帧头*/
-  txHeader.StdId = 0x123;                // 11位标准帧ID
-  txHeader.ExtId = 0;                    // 标准帧不使用扩展ID
-  txHeader.IDE = CAN_ID_STD;             // 标准帧
-  txHeader.RTR = CAN_RTR_DATA;           // 数据帧
-  txHeader.DLC = 8;                      // 数据长度为 8 字节
-  txHeader.TransmitGlobalTime = DISABLE; // 不发送全局时间戳
 
   printf("CAN1 Sight Start\r\n");
 
@@ -156,92 +230,49 @@ int main(void) {
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
-    // 主循环检测到新帧标志
-    if (rxPending != 0U) 
-    {
-      // 注意：这里采用了关中断保护"复制＋清标志"
-      uint32_t primask = __get_PRIMASK(); /* ① 先记下当前中断开关状态 */
-      __disable_irq();                    /* ② 关中断：进入临界区 */
-      CAN_RxHeaderTypeDef rxLocal = rxHeader;
-      uint8_t rxDataLocal[8];
-      for (uint32_t i = 0U; i < 8U; i++) {
-        rxDataLocal[i] = rxData[i]; /* ③ 复制（此刻中断不会插入，副本干净） */
-      }
-      rxPending = 0U; /* ④ 复制完才清标志（顺序正确） */
-      if (primask == 0U) {
-        __enable_irq(); /* ⑤ 恢复中断：只有进来时是开的才开回去 */
-      }
 
-      uint32_t rxId;
-      const char *frameType; // 帧格式标签
-      const char *frameKind; // 帧类型标签
+    CanFrame frame;
 
-      if (rxLocal.IDE == CAN_ID_STD) {
-        rxId = rxLocal.StdId; // 使用标准 ID
-        frameType = "STD";     // 标准帧
-      } else {
-        rxId = rxLocal.ExtId; // 使用扩展 ID
-        frameType = "EXT";     // 扩展帧
-      }
+    while (CAN_RxQueue_Pop(&frame) != 0U) {
+      const char *frameType = (frame.ide == CAN_ID_STD) ? "STD" : "EXT";
+      const char *frameRTR = (frame.rtr == CAN_RTR_DATA) ? "DATA" : "REMOTE";
 
-      frameKind =
-          (rxLocal.RTR == CAN_RTR_DATA) ? "DATA" : "REMOTE"; // 数据帧或远程帧
-      printf("CAN1 RX: %s %s ID=0x%lX DLC=%lu Data=", frameType, frameKind,
-             (unsigned long)rxId, (unsigned long)rxLocal.DLC);
+      // 打印帧格式、类型、ID、DLC
+      printf("CAN1 RX: %s %s ID:0x%lX DLC:%u Data:", frameType, frameRTR,
+             (unsigned long)frame.id, (unsigned int)frame.dlc);
 
-      if (rxLocal.RTR == CAN_RTR_DATA) 
+      //远程数据帧没有数据字节，只有数据帧打印
+      if (frame.rtr == CAN_RTR_DATA) 
       {
-        for (uint8_t i = 0U; i < rxLocal.DLC && i < 8U; i++) {
-          printf("%02X ", (unsigned int)rxDataLocal[i]); // 打印数据字节
+        for (uint8_t i = 0U; i < frame.dlc; i++) 
+        {
+          printf(" %02X", (unsigned int)frame.data[i]);
         }
       }
+
       printf("\r\n");
     }
-
-    txData[0] = txSequence; // 将递增的序列号放入数据帧的第一个字节
-    txData[1] = 0x11;
-    txData[2] = 0x22;
-    txData[3] = 0x33;
-    txData[4] = 0x44;
-    txData[5] = 0x55;
-    txData[6] = 0x66;
-    txData[7] = 0x77;
-
-    /* 检查 CAN 控制器是否至少有一个空闲发送邮箱 */
-    if (HAL_CAN_GetTxMailboxesFreeLevel(&hcan1) > 0) // 检查是否有空闲的发送邮箱
-    {
-      /* 将帧提交给 HAL/CAN 控制器发送 */
-      if (HAL_CAN_AddTxMessage(&hcan1, &txHeader, txData, &txMailbox) ==
-          HAL_OK) {
-        printf("CAN1 queue: ID:0x123 Sequence=%d\r\n", txSequence);
-        txSequence++; // 成功发送后递增序列号
-      } else {
-        printf("CAN1 Message Send Failed\r\n");
-      }
-    } else {
-      printf("CAN1 No Free Mailbox\r\n");
-    }
-    HAL_Delay(500); // 延时 500 毫秒
   }
   /* USER CODE END 3 */
 }
 
 /**
- * @brief System Clock Configuration
- * @retval None
- */
-void SystemClock_Config(void) {
+  * @brief System Clock Configuration
+  * @retval None
+  */
+void SystemClock_Config(void)
+{
   RCC_OscInitTypeDef RCC_OscInitStruct = {0};
   RCC_ClkInitTypeDef RCC_ClkInitStruct = {0};
 
   /** Configure the main internal regulator output voltage
-   */
+  */
   __HAL_RCC_PWR_CLK_ENABLE();
   __HAL_PWR_VOLTAGESCALING_CONFIG(PWR_REGULATOR_VOLTAGE_SCALE1);
 
   /** Initializes the RCC Oscillators according to the specified parameters
-   * in the RCC_OscInitTypeDef structure.
-   */
+  * in the RCC_OscInitTypeDef structure.
+  */
   RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSE;
   RCC_OscInitStruct.HSEState = RCC_HSE_ON;
   RCC_OscInitStruct.PLL.PLLState = RCC_PLL_ON;
@@ -250,20 +281,22 @@ void SystemClock_Config(void) {
   RCC_OscInitStruct.PLL.PLLN = 168;
   RCC_OscInitStruct.PLL.PLLP = RCC_PLLP_DIV2;
   RCC_OscInitStruct.PLL.PLLQ = 4;
-  if (HAL_RCC_OscConfig(&RCC_OscInitStruct) != HAL_OK) {
+  if (HAL_RCC_OscConfig(&RCC_OscInitStruct) != HAL_OK)
+  {
     Error_Handler();
   }
 
   /** Initializes the CPU, AHB and APB buses clocks
-   */
-  RCC_ClkInitStruct.ClockType = RCC_CLOCKTYPE_HCLK | RCC_CLOCKTYPE_SYSCLK |
-                                RCC_CLOCKTYPE_PCLK1 | RCC_CLOCKTYPE_PCLK2;
+  */
+  RCC_ClkInitStruct.ClockType = RCC_CLOCKTYPE_HCLK|RCC_CLOCKTYPE_SYSCLK
+                              |RCC_CLOCKTYPE_PCLK1|RCC_CLOCKTYPE_PCLK2;
   RCC_ClkInitStruct.SYSCLKSource = RCC_SYSCLKSOURCE_PLLCLK;
   RCC_ClkInitStruct.AHBCLKDivider = RCC_SYSCLK_DIV1;
   RCC_ClkInitStruct.APB1CLKDivider = RCC_HCLK_DIV4;
   RCC_ClkInitStruct.APB2CLKDivider = RCC_HCLK_DIV2;
 
-  if (HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_5) != HAL_OK) {
+  if (HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_5) != HAL_OK)
+  {
     Error_Handler();
   }
 }
@@ -275,23 +308,98 @@ int __io_putchar(int ch) {
   return ch;
 }
 
-// 处理接收到的 CAN 消息
-void HAL_CAN_RxFifo0MsgPendingCallback(CAN_HandleTypeDef *hcan) {
-  if (hcan->Instance == CAN1) // 确认是 CAN1 的中断
+// 从硬件 FIFO 取出报文，整理成 CanFrame，再放入软件队列
+void HAL_CAN_RxFifo0MsgPendingCallback(CAN_HandleTypeDef *hcan)
+{
+  if (hcan->Instance != CAN1) // 确认是 CAN1 的中断
   {
-    // 从 FIFO0 中读取接收到的消息
-    if (HAL_CAN_GetRxMessage(hcan, CAN_RX_FIFO0, &rxHeader, rxData) == HAL_OK) {
-      rxPending = 1U; // 设置标志，表示有新数据到达
-    }
+    return;
   }
+
+  // 从硬件 FIFO 读取报文
+  while (HAL_CAN_GetRxFifoFillLevel(hcan, CAN_RX_FIFO0) > 0U)
+    {
+        CAN_RxHeaderTypeDef header;
+        uint8_t rxBytes[8] = {0};
+
+        /* 从 CAN 控制器的 FIFO0 读取一帧 */
+        if (HAL_CAN_GetRxMessage(
+                hcan,
+                CAN_RX_FIFO0,
+                &header,
+                rxBytes) != HAL_OK)
+        {
+            /* 读取失败时结束本次回调 */
+            break;
+        }
+
+        canRxFramesReadFromFifo++; // 成功读取一帧，计数器加 1
+
+        /* 把 HAL 收到的数据整理到项目统一的报文结构 */
+        CanFrame frame = {0};
+
+        frame.timestamp_us = __HAL_TIM_GET_COUNTER(&htim2); // 记录接收时间戳
+        frame.ide = (uint8_t)header.IDE;
+        frame.rtr = (uint8_t)header.RTR;
+
+        /* 保护 data[8]：不允许 DLC 超过经典 CAN 的 8 字节 */
+        frame.dlc = (header.DLC <= 8U) ? (uint8_t)header.DLC : 8U;
+
+        /* 根据帧格式选择正确的 ID 字段 */
+        if (header.IDE == CAN_ID_STD)
+        {
+            frame.id = header.StdId;
+        }
+        else
+        {
+            frame.id = header.ExtId;
+        }
+
+        /* 复制报文数据；远程帧的 DLC 不表示这里有数据可复制 */
+        if (header.RTR == CAN_RTR_DATA)
+        {
+            for (uint8_t i = 0U; i < frame.dlc; i++)
+            {
+                frame.data[i] = rxBytes[i];
+            }
+        }
+
+        /* 入队失败表示软件队列已满，函数内部会增加溢出计数 */
+        (void)CAN_RxQueue_PushFromISR(&frame);
+    }
+}
+
+void HAL_CAN_ErrorCallback(CAN_HandleTypeDef *hcan)
+{
+  //只处理 CAN1 的错误
+    if (hcan->Instance != CAN1)
+    {
+        return;
+    }
+
+    // 获读取 HAL 当前累积的 CAN 错误位
+    uint32_t error = HAL_CAN_GetError(hcan);
+
+    // 保存错误位，方便之后通过调试器查看
+    canHalErrorFlags |= error;
+
+    // 检查是否发生了 FIFO0 溢出
+    if ((error & HAL_CAN_ERROR_RX_FOV0) != 0U)
+    {
+        canRxFifo0OverrunEvents++; // FIFO0 溢出事件计数器加 1
+    }
+
+    //HAL错误位是累积保存的，先保存到canHalErrorFlags，再清除HAL内部错误状态
+    (void)HAL_CAN_ResetError(hcan);
 }
 /* USER CODE END 4 */
 
 /**
- * @brief  This function is executed in case of error occurrence.
- * @retval None
- */
-void Error_Handler(void) {
+  * @brief  This function is executed in case of error occurrence.
+  * @retval None
+  */
+void Error_Handler(void)
+{
   /* USER CODE BEGIN Error_Handler_Debug */
   /* User can add his own implementation to report the HAL error return state */
   __disable_irq();
@@ -301,13 +409,14 @@ void Error_Handler(void) {
 }
 #ifdef USE_FULL_ASSERT
 /**
- * @brief  Reports the name of the source file and the source line number
- *         where the assert_param error has occurred.
- * @param  file: pointer to the source file name
- * @param  line: assert_param error line source number
- * @retval None
- */
-void assert_failed(uint8_t *file, uint32_t line) {
+  * @brief  Reports the name of the source file and the source line number
+  *         where the assert_param error has occurred.
+  * @param  file: pointer to the source file name
+  * @param  line: assert_param error line source number
+  * @retval None
+  */
+void assert_failed(uint8_t *file, uint32_t line)
+{
   /* USER CODE BEGIN 6 */
   /* User can add his own implementation to report the file name and line
      number, ex: printf("Wrong parameters value: file %s on line %d\r\n", file,
