@@ -19,6 +19,9 @@
 /* Includes ------------------------------------------------------------------*/
 #include "main.h"
 #include "can.h"
+#include "dma.h"
+#include "fatfs.h"
+#include "sdio.h"
 #include "tim.h"
 #include "usart.h"
 #include "gpio.h"
@@ -26,19 +29,11 @@
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
 #include "stdio.h"
+#include "can_logger.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
 /* USER CODE BEGIN PTD */
-// 软件队列里保存的单帧 CAN 报文
-typedef struct {
-  uint32_t timestamp_us; // 收到报文时的系统微秒计数
-  uint32_t id;           // 标准帧或者扩展帧ID
-  uint8_t ide;           // CAN_ID_STD：标准帧；CAN_ID_EXT：扩展帧
-  uint8_t rtr;     // CAN_RTR_DATA：数据帧；CAN_RTR_REMOTE：远程帧
-  uint8_t dlc;     // 数据长度,经典CAN范围是0~8
-  uint8_t data[8]; // 报文数据，
-} CanFrame;
 /* USER CODE END PTD */
 
 /* Private define ------------------------------------------------------------*/
@@ -87,6 +82,7 @@ void SystemClock_Config(void);
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
+
 
 /*
 生产者函数：由 CAN 接收中断调用
@@ -174,15 +170,28 @@ int main(void)
 
   /* Initialize all configured peripherals */
   MX_GPIO_Init();
+  MX_DMA_Init();
   MX_CAN1_Init();
   MX_USART6_UART_Init();
   MX_TIM2_Init();
+  MX_SDIO_SD_Init();
+  MX_FATFS_Init();
   /* USER CODE BEGIN 2 */
 
   if(HAL_TIM_Base_Start(&htim2) != HAL_OK)
   {
     Error_Handler();
   }
+
+  /*
+   * 尝试挂载 SD 卡并打开 CANLOG.CSV。
+   * 初始化失败只关闭日志功能，不阻止 CAN 接收和串口显示。
+   */
+  if (CanLogger_Init() == 0U)
+  {
+    printf("SD LOG: disabled; CAN reception will continue\r\n");
+  }
+
 
   /*CAN1过滤器配置，ID和Mask都设为0，表示接收所有符合格式的报文。*/
   CAN_FilterTypeDef canFilter = {0};
@@ -234,6 +243,9 @@ int main(void)
     CanFrame frame;
 
     while (CAN_RxQueue_Pop(&frame) != 0U) {
+      /* 只在主循环里写日志；CAN 中断只负责接收并把数据放入队列。 */
+      CanLogger_AddFrame(&frame);
+
       const char *frameType = (frame.ide == CAN_ID_STD) ? "STD" : "EXT";
       const char *frameRTR = (frame.rtr == CAN_RTR_DATA) ? "DATA" : "REMOTE";
 
@@ -252,6 +264,9 @@ int main(void)
 
       printf("\r\n");
     }
+
+    /* 定期把缓冲记录同步到卡；不在 CAN 中断里调用 FatFs。 */
+    CanLogger_Process();
   }
   /* USER CODE END 3 */
 }
@@ -280,7 +295,7 @@ void SystemClock_Config(void)
   RCC_OscInitStruct.PLL.PLLM = 4;
   RCC_OscInitStruct.PLL.PLLN = 168;
   RCC_OscInitStruct.PLL.PLLP = RCC_PLLP_DIV2;
-  RCC_OscInitStruct.PLL.PLLQ = 4;
+  RCC_OscInitStruct.PLL.PLLQ = 7;
   if (HAL_RCC_OscConfig(&RCC_OscInitStruct) != HAL_OK)
   {
     Error_Handler();
