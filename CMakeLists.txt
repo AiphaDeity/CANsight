@@ -36,6 +36,14 @@ add_executable(${CMAKE_PROJECT_NAME})
 
 # Add STM32CubeMX generated sources
 add_subdirectory(cmake/stm32cubemx)
+set(LV_BUILD_CONF_PATH
+    "${CMAKE_CURRENT_SOURCE_DIR}/Middlewares/Third_Party/lv_conf.h"
+    CACHE PATH "LVGL configuration file" FORCE)
+set(CONFIG_LV_BUILD_DEMOS OFF CACHE BOOL "" FORCE)
+set(CONFIG_LV_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
+
+# 使用 LVGL 9.6 自带的 CMake 构建脚本
+add_subdirectory(Middlewares/Third_Party/lvgl)
 
 # Link directories setup
 target_link_directories(${CMAKE_PROJECT_NAME} PRIVATE
@@ -45,11 +53,21 @@ target_link_directories(${CMAKE_PROJECT_NAME} PRIVATE
 # Add sources to executable
 target_sources(${CMAKE_PROJECT_NAME} PRIVATE
     # Add user sources here
+    ${CMAKE_CURRENT_SOURCE_DIR}/Core/Src/can_logger.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/GUI/Port/lv_port_disp.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/GUI/Port/lv_port_indev.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/GUI/Board/LCD/lcd.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/GUI/Board/LCD/delay.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/GUI/Board/Touch/gt911.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/GUI/Board/Touch/lcd_touch.c
 )
 
 # Add include paths
 target_include_directories(${CMAKE_PROJECT_NAME} PRIVATE
     # Add user defined include paths
+    ${CMAKE_CURRENT_SOURCE_DIR}/GUI/Port
+    ${CMAKE_CURRENT_SOURCE_DIR}/GUI/Board/LCD
+    ${CMAKE_CURRENT_SOURCE_DIR}/GUI/Board/Touch
 )
 
 # Add project symbols (macros)
@@ -63,6 +81,6 @@ list(REMOVE_ITEM CMAKE_C_IMPLICIT_LINK_LIBRARIES ob)
 # Add linked libraries
 target_link_libraries(${CMAKE_PROJECT_NAME}
     stm32cubemx
-
     # Add user defined libraries
+    lvgl
 )

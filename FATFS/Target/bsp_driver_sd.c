@@ -55,7 +55,7 @@ __weak uint8_t BSP_SD_Init(void)
   }
   /* HAL SD initialization */
   sd_state = HAL_SD_Init(&hsd);
-  /*当前采用 1 位总线：HAL_SD_Init已按1位模式初始化SD卡和SDIO。 */
+
   return sd_state;
 }
 /* USER CODE BEGIN AfterInitSection */

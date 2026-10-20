@@ -21,15 +21,20 @@
 #include "can.h"
 #include "dma.h"
 #include "fatfs.h"
+#include "i2c.h"
 #include "sdio.h"
 #include "tim.h"
 #include "usart.h"
 #include "gpio.h"
+#include "fsmc.h"
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
 #include "stdio.h"
 #include "can_logger.h"
+#include "lv_port_disp.h"
+#include "lv_port_indev.h"
+#include "gt911.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -139,6 +144,16 @@ static uint8_t CAN_RxQueue_Pop(CanFrame *frame) {
   return 1U; // 出队成功
 }
 
+/* 点击测试按钮后更新文字，用来验证 GT911 触摸输入和 LVGL 事件链路。 */
+static void TestButton_EventCallback(lv_event_t *event)
+{
+  if (lv_event_get_code(event) == LV_EVENT_CLICKED)
+  {
+    lv_obj_t *label = (lv_obj_t *)lv_event_get_user_data(event);
+    lv_label_set_text(label, "Touch OK");
+  }
+}
+
 /* USER CODE END 0 */
 
 /**
@@ -176,7 +191,35 @@ int main(void)
   MX_TIM2_Init();
   MX_SDIO_SD_Init();
   MX_FATFS_Init();
+  MX_FSMC_Init();
+  MX_I2C1_Init();
   /* USER CODE BEGIN 2 */
+
+  // GT911 复位及 I2C 地址选择。必须在 LCD_Init 之前执行。
+  init_gt911(GT911_I2C_SLAVE);
+
+  lv_init();
+  lv_port_disp_init();
+  lv_port_indev_init();
+
+  /* 创建第一版测试界面：背景、标题和可点击按钮。 */
+  lv_obj_t *screen = lv_screen_active();
+  lv_obj_set_style_bg_color(screen, lv_color_hex(0x202020), LV_PART_MAIN);
+  lv_obj_set_style_bg_opa(screen, LV_OPA_COVER, LV_PART_MAIN);
+
+  lv_obj_t *title = lv_label_create(screen);
+  lv_label_set_text(title, "CanSight LVGL 9.6");
+  lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 30);
+
+  lv_obj_t *button = lv_button_create(screen);
+  lv_obj_set_size(button, 220, 90);
+  lv_obj_center(button);
+
+  lv_obj_t *button_label = lv_label_create(button);
+  lv_label_set_text(button_label, "Touch to test");
+  lv_obj_center(button_label);
+  lv_obj_add_event_cb(button, TestButton_EventCallback, LV_EVENT_CLICKED,
+                      button_label);
 
   if(HAL_TIM_Base_Start(&htim2) != HAL_OK)
   {
@@ -239,6 +282,11 @@ int main(void)
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
+
+    // 处理界面刷新、触摸输入和 LVGL 定时任务
+    (void)lv_timer_handler();
+    // 给LVGL留出运行间隔；5ms是初始值
+    HAL_Delay(5);
 
     CanFrame frame;
 
