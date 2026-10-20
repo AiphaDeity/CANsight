@@ -35,6 +35,7 @@
 #include "lv_port_disp.h"
 #include "lv_port_indev.h"
 #include "gt911.h"
+#include <lvgl/core/lv_obj_pos.h>
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -203,23 +204,97 @@ int main(void)
   lv_port_indev_init();
 
   /* 创建第一版测试界面：背景、标题和可点击按钮。 */
+  // 获取当前正在显示的活动屏幕对象
   lv_obj_t *screen = lv_screen_active();
+  // 设置屏幕主体部分背景色：0x202020 深灰黑色
   lv_obj_set_style_bg_color(screen, lv_color_hex(0x202020), LV_PART_MAIN);
+  // 背景完全不透明（覆盖模式）
   lv_obj_set_style_bg_opa(screen, LV_OPA_COVER, LV_PART_MAIN);
 
+  // 创建文本标签，父对象是screen
   lv_obj_t *title = lv_label_create(screen);
   lv_label_set_text(title, "CanSight LVGL 9.6");
+  // 对齐：屏幕顶部居中，X偏移0，Y向下偏移30像素
   lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 30);
 
+  // 创建按钮控件，父对象screen
   lv_obj_t *button = lv_button_create(screen);
+  // 按钮大小：220像素宽，90像素高
   lv_obj_set_size(button, 220, 90);
+  // 对齐：屏幕中心
   lv_obj_center(button);
 
+  // 在按钮内部创建标签（按钮子控件）
   lv_obj_t *button_label = lv_label_create(button);
   lv_label_set_text(button_label, "Touch to test");
   lv_obj_center(button_label);
+  // 添加点击事件监听器，并指定用户数据
   lv_obj_add_event_cb(button, TestButton_EventCallback, LV_EVENT_CLICKED,
                       button_label);
+
+  // 创建一个按钮
+  lv_obj_t *button2 = lv_button_create(screen);
+  // 设置按钮的大小
+  lv_obj_set_size(button2, 220, 90);
+  // 设置按钮的位置
+  lv_obj_set_pos(button2, 10, 10);
+  // 设置按钮的颜色
+  lv_obj_set_style_bg_color(button2, lv_color_hex(0x202020), LV_PART_MAIN);
+  // 创建一个标签，作为按钮的子控件
+  lv_obj_t *button_label2 = lv_label_create(button2);
+  lv_label_set_text(button_label2, "top left corner"); 
+  lv_obj_set_align(button_label2, LV_ALIGN_CENTER);
+  // 添加点击事件监听器
+  lv_obj_add_event_cb(button2, TestButton_EventCallback, LV_EVENT_CLICKED,
+                      button_label2);
+
+  // 创建一个按钮
+  lv_obj_t *button3 = lv_button_create(screen);
+  // 设置按钮的大小
+  lv_obj_set_size(button3, 220, 90);
+  // 设置按钮的位置
+  lv_obj_set_pos(button3, 570, 10);
+  // 设置按钮的颜色
+  lv_obj_set_style_bg_color(button3, lv_color_hex(0x202020), LV_PART_MAIN);
+  // 创建一个标签，作为按钮的子控件
+  lv_obj_t *button_label3 = lv_label_create(button3);
+  lv_label_set_text(button_label3, "top right corner"); 
+  lv_obj_set_align(button_label3, LV_ALIGN_CENTER);
+  // 添加点击事件监听器
+  lv_obj_add_event_cb(button3, TestButton_EventCallback, LV_EVENT_CLICKED,
+                      button_label3);
+
+  // 创建一个按钮
+  lv_obj_t *button4 = lv_button_create(screen);
+  // 设置按钮的大小
+  lv_obj_set_size(button4, 220, 90);
+  // 设置按钮的位置
+  lv_obj_set_pos(button4, 10, 380);
+  // 设置按钮的颜色
+  lv_obj_set_style_bg_color(button4, lv_color_hex(0x202020), LV_PART_MAIN);
+  // 创建一个标签，作为按钮的子控件
+  lv_obj_t *button_label4 = lv_label_create(button4);
+  lv_label_set_text(button_label4, "bottom left corner"); 
+  lv_obj_set_align(button_label4, LV_ALIGN_CENTER);
+  // 添加点击事件监听器
+  lv_obj_add_event_cb(button4, TestButton_EventCallback, LV_EVENT_CLICKED,
+                      button_label4);
+
+  // 创建一个按钮
+  lv_obj_t *button5 = lv_button_create(screen);
+  // 设置按钮的大小
+  lv_obj_set_size(button5, 220, 90);
+  // 设置按钮的位置
+  lv_obj_set_pos(button5, 570, 380);
+  // 设置按钮的颜色 
+  lv_obj_set_style_bg_color(button5, lv_color_hex(0x202020), LV_PART_MAIN);
+  // 创建一个标签，作为按钮的子控件
+  lv_obj_t *button_label5 = lv_label_create(button5);
+  lv_label_set_text(button_label5, "bottom right corner"); 
+  lv_obj_set_align(button_label5, LV_ALIGN_CENTER);
+  // 添加点击事件监听器
+  lv_obj_add_event_cb(button5, TestButton_EventCallback, LV_EVENT_CLICKED,
+                      button_label5);
 
   if(HAL_TIM_Base_Start(&htim2) != HAL_OK)
   {
