@@ -8,8 +8,10 @@ set(CMAKE_C_STANDARD_REQUIRED ON)
 # 使用 STM32 项目中已有的 LVGL 9.6 源码
 set(LVGL_DIR "${CMAKE_CURRENT_LIST_DIR}/../Middlewares/Third_Party/lvgl")
 
-# 首次运行先用 LVGL 内部默认配置
+# 模拟器使用系统堆；中文控件显式引用共用的 lv_font_cansight_14。
+# 桌面绘制任务和控件的动态内存需求不同于 STM32，单独配置内存分配方式。
 set(LV_CONF_SKIP ON CACHE BOOL "Use LVGL internal defaults" FORCE)
+set(LV_BUILD_CONF_PATH "" CACHE PATH "" FORCE)
 
 # 电脑模拟暂时不编译示例、Demo 和矢量图形扩展
 set(CONFIG_LV_BUILD_EXAMPLES OFF CACHE BOOL
@@ -27,10 +29,18 @@ add_subdirectory("${LVGL_DIR}" "${CMAKE_CURRENT_BINARY_DIR}/lvgl")
 target_compile_definitions(lvgl PUBLIC
     LV_USE_WINDOWS=1
     LV_USE_OS=5
+    LV_USE_STDLIB_MALLOC=LV_STDLIB_CLIB
 )
 
-# 创建可执行文件
-add_executable(cansight_sim main.c) 
+# 创建可执行文件，并直接编译与 STM32 共用的界面实现
+add_executable(cansight_sim
+    main.c
+    ../GUI/App/ui.c
+    ../GUI/App/lv_font_cansight_14.c
+)
+target_include_directories(cansight_sim PRIVATE
+    ../GUI/App
+)
 
 # 链接库
 target_link_libraries(cansight_sim PRIVATE

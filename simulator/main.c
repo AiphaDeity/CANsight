@@ -3,6 +3,7 @@
 #include "lvgl.h"
 #include "lvgl/drivers/windows/lv_windows_display.h"
 #include "lvgl/drivers/windows/lv_windows_input.h"
+#include "ui.h"
 
 int main(void)
 {
@@ -27,10 +28,8 @@ int main(void)
         return 2;
     }
 
-    /* 放一个启动提示，确认模拟窗口正常显示 */
-    lv_obj_t * label = lv_label_create(lv_screen_active());
-    lv_label_set_text(label, "CanSight LVGL 9.6 simulator is running");
-    lv_obj_center(label);
+    /* 调用与 STM32 固件共用的界面 */
+    ui_init();
 
     /* 持续运行 LVGL 定时器 */
     while(1) {

@@ -60,6 +60,8 @@ target_sources(${CMAKE_PROJECT_NAME} PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/GUI/Board/LCD/delay.c
     ${CMAKE_CURRENT_SOURCE_DIR}/GUI/Board/Touch/gt911.c
     ${CMAKE_CURRENT_SOURCE_DIR}/GUI/Board/Touch/lcd_touch.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/GUI/App/ui.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/GUI/App/lv_font_cansight_14.c
 )
 
 # Add include paths
@@ -68,6 +70,8 @@ target_include_directories(${CMAKE_PROJECT_NAME} PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/GUI/Port
     ${CMAKE_CURRENT_SOURCE_DIR}/GUI/Board/LCD
     ${CMAKE_CURRENT_SOURCE_DIR}/GUI/Board/Touch
+    ${CMAKE_CURRENT_SOURCE_DIR}/GUI/App
+
 )
 
 # Add project symbols (macros)
