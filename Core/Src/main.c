@@ -32,6 +32,7 @@
 /* USER CODE BEGIN Includes */
 #include "stdio.h"
 #include "can_logger.h"
+#include "can_timestamp.h"
 #include "can_stats.h"
 #include "log_player.h"
 #include "lv_port_disp.h"
@@ -247,7 +248,7 @@ int main(void)
   ui_set_archive_callback(CAN_RequestArchive);
   ui_init();
 
-  if(HAL_TIM_Base_Start(&htim2) != HAL_OK)
+  if(CanTimestamp_Start() == 0U)
   {
     Error_Handler();
   }
@@ -442,7 +443,7 @@ void HAL_CAN_RxFifo0MsgPendingCallback(CAN_HandleTypeDef *hcan)
         // 把 HAL 收到的数据整理到项目统一的报文结构
         CanFrame frame = {0};
 
-        frame.timestamp_us = __HAL_TIM_GET_COUNTER(&htim2); // 记录接收时间戳
+        frame.timestamp_us = CanTimestamp_GetUs(); // 在接收时保存已展开的微秒时间。
         frame.ide = (uint8_t)header.IDE;
         frame.rtr = (uint8_t)header.RTR;
 

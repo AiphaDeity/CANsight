@@ -10,7 +10,7 @@
 typedef struct {
     CanFrame latest;       //最新一帧，包含时间戳、ID、格式、DLC 和数据
     uint32_t count;        // 本次启动以来，该组合累计收到的帧数。
-    uint32_t period_us;    //最近两帧接收时间之差，单位微秒，不是平均周期。
+    uint64_t period_us;    // 最近两帧接收时间之差，单位微秒，不是平均周期。
     uint8_t has_period;    //收到第二帧后置 1；只有第一帧时周期尚不可计算。 
 } CanStatsEntry;
 

@@ -34,13 +34,45 @@ static uint8_t reader_open;                 // 历史文件是否处于打开状
 static uint8_t header_seen;                 // 当前文件的 CSV 表头是否已通过校验。
 static uint16_t line_length;                // 当前尚未解析的文本行长度。
 static char line[128];                      // 跨读取批次保留的不完整行，预留字符串结束符。
-static uint8_t chunk[256];                  // 单次读取缓冲区，不随日志大小增长。
+static uint8_t chunk[1024];                 // 单次读取缓冲区，不随日志大小增长。
 static int query_direction;                 // 0：首页；正数：下一页；负数：上一页。
 static uint32_t query_anchor;               // 翻页的编号边界，不依赖连续文件编号。
 static uint32_t requested_page;             // 本次查询成功后发布的页号，从 0 开始。
 static LogHistoryFile candidates[LOG_PLAYER_PAGE_SIZE];  // 当前查询保留的最多四个候选条目。
 static uint8_t candidate_count;             // 候选数组中的有效条目数。
 static uint32_t scan_total;                 // 本次扫描发现的全部有效历史文件数。
+
+#define LOG_INDEX_CAPACITY 64U
+
+// 索引保存行起点之前的完整解析状态，跳转后能恢复全局帧号和旧日志回绕上下文。
+typedef struct {
+    uint64_t previous_time;
+    uint32_t offset;
+    uint32_t line_number;
+    uint32_t frames;
+    uint32_t matches;
+} LogCursor;
+
+static LogCursor cursor;
+static LogCursor checkpoints[LOG_INDEX_CAPACITY];
+static uint8_t checkpoint_count;
+static uint32_t checkpoint_stride;
+static uint32_t line_offset;                // 正在拼接的文本行在文件中的绝对字节位置。
+static uint8_t building_index;
+static uint8_t read_turn;                   // 目录与文件同时打开时交替推进，防止翻页长期等待。
+
+// 重建时立即清除旧结果，避免筛选条件与旧文件窗口混合显示。
+static void reset_browser(void)
+{
+    checkpoint_count = 0U;
+    checkpoint_stride = 64U;
+    building_index = 1U;
+    view.index_ready = view.frame_count = 0U;
+    view.legacy_time = 0U;
+    view.total_frames = view.matched_frames = view.first_match = view.scanned_bytes = 0U;
+    view.preview_error = view.line_number = 0U;
+    view.preview_state = LOG_PREVIEW_INDEXING;
+}
 
 // 关闭操作仅由主循环执行，保证切页和切文件时释放底层资源。
 static uint32_t close_directory(void)
@@ -114,6 +146,7 @@ void LogPlayer_Init(const char *root)
     close_error = 0U;
     view.revision = 1U;  // 使用非零初始版本，使界面可以识别初始化后的数据。
     active = query_pending = open_pending = storage_pending = 0U;
+    checkpoint_count = building_index = read_turn = 0U;
 #ifndef CAN_PLAYER_SIMULATOR
     archive_revision = CanLogger_GetArchiveRevision();
 #endif
@@ -193,8 +226,45 @@ void LogPlayer_RequestOpen(const char *name)
     active = 1U;
     snprintf(view.selected_name, sizeof(view.selected_name), "%s", name);
     view.delete_state = LOG_DELETE_IDLE;
+    reset_browser();
+    view.selected_size = 0U;
+    open_pending = 1U;
+    view.revision++;
+}
+
+// 筛选只重建只读索引，不修改接收统计、日志内容或归档规则。
+uint8_t LogPlayer_SetFilter(uint32_t id, uint8_t enabled)
+{
+    if(id > 0x1FFFFFFFU || close_error || view.delete_state == LOG_DELETE_PENDING) return 0U;
+    enabled = enabled != 0U;
+    if(view.filter_enabled == enabled && (!enabled || view.filter_id == id)) return 1U;
+    view.filter_enabled = enabled;
+    view.filter_id = id;
+    if(view.selected_name[0]) {
+        reset_browser();
+        open_pending = 1U;
+    }
+    view.revision++;
+    return 1U;
+}
+
+// 每次移动窗口首帧一条记录；读入最多五个匹配帧，首行为当前帧。
+void LogPlayer_RequestStep(int direction)
+{
+    if(!active || close_error || !view.index_ready || view.preview_state != LOG_PREVIEW_READY ||
+       view.delete_state == LOG_DELETE_PENDING || !view.matched_frames) return;
+    if(direction < 0) {
+        if(!view.first_match) return;
+        view.first_match--;
+    }
+    else {
+        if(direction == 0 || view.first_match + 1U >= view.matched_frames) return;
+        view.first_match++;
+    }
+    building_index = 0U;
     view.preview_state = LOG_PREVIEW_LOADING;
-    view.preview_error = view.frame_count = view.line_number = view.selected_size = 0U;
+    view.frame_count = 0U;
+    view.delete_state = LOG_DELETE_IDLE;
     open_pending = 1U;
     view.revision++;
 }
@@ -296,8 +366,10 @@ static void delete_history(void)
         view.selected_name[0] = '\0';
         view.selected_size = view.frame_count = view.line_number = view.preview_error = 0U;
         view.preview_state = LOG_PREVIEW_IDLE;
+        view.index_ready = 0U;
+        view.total_frames = view.matched_frames = 0U;
     }
-    else if(view.preview_state == LOG_PREVIEW_LOADING) {
+    else if(view.preview_state == LOG_PREVIEW_LOADING || view.preview_state == LOG_PREVIEW_INDEXING) {
         view.preview_state = LOG_PREVIEW_IO_ERROR;
         view.preview_error = error;
     }
@@ -419,6 +491,7 @@ static void preview_failed(LogPreviewState state, uint32_t error)
     uint32_t close_error = close_reader();
     view.preview_state = close_error ? LOG_PREVIEW_IO_ERROR : state;
     view.preview_error = close_error ? close_error : error;
+    if(view.preview_state != LOG_PREVIEW_READY && view.preview_state != LOG_PREVIEW_EMPTY) view.index_ready = 0U;
     view.revision++;
 }
 
@@ -429,6 +502,7 @@ static void start_preview(void)
     uint32_t error = close_reader();
     if(error != 0U) { preview_failed(LOG_PREVIEW_IO_ERROR, error); return; }
     char path[320];
+    uint32_t expected_size = view.selected_size;
     snprintf(path, sizeof(path), "%s/%s", root_path, view.selected_name);
 #ifdef CAN_PLAYER_SIMULATOR
     reader = fopen(path, "rb");
@@ -455,10 +529,43 @@ static void start_preview(void)
     view.selected_size = (uint32_t)f_size(&reader);
 #endif
     reader_open = 1U;
-    // 文件切换后必须重新校验表头，并丢弃上一个文件留下的未完整文本行。
-    header_seen = 0U;
+    if(!building_index && view.selected_size != expected_size) {
+        preview_failed(LOG_PREVIEW_IO_ERROR, 9U);
+        return;
+    }
+    memset(&cursor, 0, sizeof(cursor));
+    header_seen = building_index ? 0U : 1U;
     line_length = 0U;
+    if(!building_index) {
+        // 固定索引按匹配序号递增，选择不超过目标的最近起点。
+        for(unsigned i = 0U; i < checkpoint_count; i++) {
+            if(checkpoints[i].matches > view.first_match) break;
+            cursor = checkpoints[i];
+        }
+#ifdef CAN_PLAYER_SIMULATOR
+        if(fseek(reader, (long)cursor.offset, SEEK_SET) != 0) error = 1U;
+#else
+        error = (uint32_t)f_lseek(&reader, cursor.offset);
+#endif
+        if(error) { preview_failed(LOG_PREVIEW_IO_ERROR, error); return; }
+    }
+    line_offset = cursor.offset;
     view.revision++;
+}
+
+// 十进制时间单独使用 64 位转换，拒绝负数、尾随字符及整数溢出。
+static uint8_t parse_timestamp(const char *text, uint64_t *value)
+{
+    if(!*text) return 0U;
+    uint64_t result = 0U;
+    while(*text) {
+        if(*text < '0' || *text > '9') return 0U;
+        unsigned digit = (unsigned)(*text++ - '0');
+        if(result > (UINT64_MAX - digit) / 10U) return 0U;
+        result = result * 10U + digit;
+    }
+    *value = result;
+    return 1U;
 }
 
 // 严格解析无符号整数，拒绝符号、尾随字符及 32 位溢出。
@@ -498,7 +605,7 @@ static uint8_t parse_frame(char *text, CanFrame *frame)
     }
     if(strchr(fields[5], ',') != NULL) return 0U;
     memset(frame, 0, sizeof(*frame));
-    if(!parse_number(fields[0], 10U, &frame->timestamp_us)) return 0U;
+    if(!parse_timestamp(fields[0], &frame->timestamp_us)) return 0U;
     // IDE=4、RTR=2 与 STM32 HAL 报文标志保持一致，解析模块无需依赖 HAL。
     if(strcmp(fields[1], "EXT") == 0) frame->ide = 4U;
     else if(strcmp(fields[1], "STD") != 0) return 0U;
@@ -527,10 +634,27 @@ static uint8_t parse_frame(char *text, CanFrame *frame)
     return *data == '\0';
 }
 
-// 处理一条完整文本行：首行校验表头，其余非空行转换为预览帧。
+// 索引满时保留偶数项并加倍间隔，使任何大小的文件最多使用 64 个定位点。
+static void retain_checkpoint(void)
+{
+    if(cursor.matches % checkpoint_stride) return;
+    if(checkpoint_count == LOG_INDEX_CAPACITY) {
+        for(unsigned i = 0; i < LOG_INDEX_CAPACITY / 2U; i++) checkpoints[i] = checkpoints[i * 2U];
+        checkpoint_count /= 2U;
+        checkpoint_stride *= 2U;
+        if(cursor.matches % checkpoint_stride) return;
+    }
+    LogCursor point = cursor;
+    point.offset = line_offset;
+    point.line_number--;  // 定位到当前帧解析前，重新读取时行号只增加一次。
+    checkpoints[checkpoint_count++] = point;
+}
+
+// 先按完整文件顺序处理时间，再应用 ID 筛选，防止被过滤报文影响时间展开。
 static uint8_t consume_line(void)
 {
-    view.line_number++;
+    cursor.line_number++;
+    view.line_number = cursor.line_number;
     if(line_length && line[line_length - 1U] == '\r') line_length--;  // 同时兼容 CRLF 和 LF。
     line[line_length] = '\0';
     char *text = line;
@@ -538,19 +662,59 @@ static uint8_t consume_line(void)
     if(view.line_number == 1U && line_length >= 3U &&
        (uint8_t)text[0] == 0xEFU && (uint8_t)text[1] == 0xBBU && (uint8_t)text[2] == 0xBFU) text += 3;
     if(!header_seen) {
-        if(strcmp(text, "timestamp_us,format,type,id,dlc,data_hex") != 0) return 0U;
+        if(strcmp(text, "timestamp_us,format,type,id,dlc,data_hex") == 0) view.legacy_time = 1U;
+        else if(strcmp(text, "timestamp_us64,format,type,id,dlc,data_hex") == 0) view.legacy_time = 0U;
+        else return 0U;
         header_seen = 1U;
     }
     else if(*text != '\0') {
-        if(!parse_frame(text, &view.frames[view.frame_count])) return 0U;
-        view.frame_count++;
-        view.revision++;
+        CanFrame frame;
+        if(!parse_frame(text, &frame)) return 0U;
+        if(view.legacy_time) {
+            if(frame.timestamp_us > UINT32_MAX) return 0U;
+            uint64_t base = cursor.previous_time & ~((uint64_t)UINT32_MAX);
+            if(cursor.frames && frame.timestamp_us < (uint32_t)cursor.previous_time) {
+                if(base > UINT64_MAX - (1ULL << 32)) return 0U;
+                base += 1ULL << 32;
+            }
+            frame.timestamp_us += base;
+        }
+        else if(cursor.frames && frame.timestamp_us < cursor.previous_time) return 0U;
+        uint8_t matches = !view.filter_enabled || frame.id == view.filter_id;
+        if(building_index && matches) retain_checkpoint();
+        cursor.previous_time = frame.timestamp_us;
+        cursor.frames++;
+        if(matches) {
+            if(cursor.matches >= view.first_match && view.frame_count < LOG_PLAYER_PREVIEW_ROWS) {
+                view.frame_numbers[view.frame_count] = cursor.frames;
+                view.frames[view.frame_count++] = frame;
+            }
+            cursor.matches++;
+        }
+        if(building_index) {
+            view.total_frames = cursor.frames;
+            view.matched_frames = cursor.matches;
+        }
     }
     line_length = 0U;  // 清空当前行长度，下一条记录从缓冲区起点继续拼接。
     return 1U;
 }
 
-// 单轮最多读取 256 字节，跨批次的不完整行保留在 line 中，不加载整份文件。
+// 完整扫描结束后发布准确计数；无匹配与空文件在界面分别说明。
+static void finish_scan(void)
+{
+    if(!header_seen) {
+        preview_failed(cursor.offset ? LOG_PREVIEW_FORMAT_ERROR : LOG_PREVIEW_EMPTY, 0U);
+        return;
+    }
+    if(building_index) {
+        view.index_ready = 1U;
+        view.scanned_bytes = view.selected_size;
+    }
+    preview_failed(view.frame_count ? LOG_PREVIEW_READY : LOG_PREVIEW_EMPTY, 0U);
+}
+
+// 单轮最多读取 1024 字节，跨批次的不完整行保留在 line 中，不加载整份文件。
 static void read_preview(void)
 {
     unsigned length;
@@ -563,12 +727,19 @@ static void read_preview(void)
     if(result != FR_OK) { preview_failed(LOG_PREVIEW_IO_ERROR, (uint32_t)result); return; }
     length = bytes;
 #endif
+    // 历史文件应保持只读；读取期间大小变化时终止，防止继续使用失效索引。
+    if(cursor.offset > view.selected_size || length > view.selected_size - cursor.offset ||
+       (length == 0U && cursor.offset != view.selected_size)) {
+        preview_failed(LOG_PREVIEW_IO_ERROR, 9U);
+        return;
+    }
     for(unsigned i = 0; i < length; i++) {
+        cursor.offset++;
         if(chunk[i] == '\n') {
             // 换行表示当前行完整；解析成功后才检查是否达到五帧预览上限。
             if(!consume_line()) { preview_failed(LOG_PREVIEW_FORMAT_ERROR, 0U); return; }
-            if(view.frame_count == LOG_PLAYER_PREVIEW_ROWS) {
-                // 达到上限即关闭文件，剩余内容留待后续逐帧浏览功能处理。
+            line_offset = cursor.offset;
+            if(!building_index && view.frame_count == LOG_PLAYER_PREVIEW_ROWS) {
                 preview_failed(LOG_PREVIEW_READY, 0U);
                 return;
             }
@@ -576,17 +747,19 @@ static void read_preview(void)
         else {
             if(chunk[i] == 0U || line_length >= sizeof(line) - 1U) {
                 // 文本中出现 NUL 或行长度超过容量时，停止预览并报告当前物理行号。
-                view.line_number++;
+                view.line_number = cursor.line_number + 1U;
                 preview_failed(LOG_PREVIEW_FORMAT_ERROR, 0U);
                 return;
             }
             line[line_length++] = (char)chunk[i];
         }
     }
+    if(building_index) view.scanned_bytes = cursor.offset;
+    view.revision++;
     if(length == 0U) {
         // 文件末尾可能没有换行符，剩余内容仍按最后一行校验，不能直接丢弃。
         if(line_length && !consume_line()) { preview_failed(LOG_PREVIEW_FORMAT_ERROR, 0U); return; }
-        preview_failed(view.frame_count ? LOG_PREVIEW_READY : LOG_PREVIEW_EMPTY, 0U);
+        finish_scan();
     }
 }
 
@@ -610,9 +783,10 @@ void LogPlayer_Process(void)
         // 页面退出后释放资源；已完成的预览保留，未完成的预览取消。
         uint32_t error = close_reader();
         if(error) preview_failed(LOG_PREVIEW_IO_ERROR, error);
-        if(view.preview_state == LOG_PREVIEW_LOADING) {
+        if(view.preview_state == LOG_PREVIEW_LOADING || view.preview_state == LOG_PREVIEW_INDEXING) {
             view.preview_state = LOG_PREVIEW_IDLE;
             view.frame_count = 0U;
+            view.index_ready = 0U;
             view.revision++;
         }
         error = close_directory();
@@ -640,7 +814,8 @@ void LogPlayer_Process(void)
             view.revision++;
         }
         if(view.list_state != LOG_LIST_ERROR) list_failed(3U);
-        if(reader_open || view.preview_state == LOG_PREVIEW_LOADING) preview_failed(LOG_PREVIEW_IO_ERROR, 3U);
+        if(reader_open || view.preview_state == LOG_PREVIEW_LOADING ||
+           view.preview_state == LOG_PREVIEW_INDEXING) preview_failed(LOG_PREVIEW_IO_ERROR, 3U);
         return;
     }
 #endif
@@ -648,10 +823,16 @@ void LogPlayer_Process(void)
     // 新请求优先于旧任务；打开新文件时由 start_preview 统一结束旧读取。
     if(query_pending) { start_query(); return; }
     if(open_pending) { start_preview(); return; }
-    // 每轮只执行一个扫描批次或一次读取，读取优先，避免用户选择后等待整个目录重扫。
-    if(reader_open) read_preview();
-    else if(directory_open) scan_directory();
-    else if(storage_pending) read_storage();
+    // 容量请求只执行一次；目录扫描与文件读取交替推进，避免长文件阻塞文件列表翻页。
+    if(storage_pending) { read_storage(); return; }
+    if(reader_open && (!directory_open || read_turn)) {
+        read_turn = 0U;
+        read_preview();
+    }
+    else if(directory_open) {
+        read_turn = 1U;
+        scan_directory();
+    }
 }
 
 // 模拟器据此缩短空闲等待时间，不代表本模块使用独立线程。

@@ -6,7 +6,7 @@
 // CAN 接收中断和主循环共用的一帧经典 CAN 报文。
 typedef struct
 {
-  uint32_t timestamp_us; // TIM2 微秒计数；32 位计数约每 71.6 分钟回绕一次。
+  uint64_t timestamp_us; // 本次启动的 64 位微秒时间，由 TIM2 及溢出计数共同提供。
   uint32_t id;           // 标准帧或扩展帧标识符。
   uint8_t ide;           // CAN_ID_STD 或 CAN_ID_EXT。
   uint8_t rtr;           // CAN_RTR_DATA 或 CAN_RTR_REMOTE。

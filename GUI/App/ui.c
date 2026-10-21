@@ -1,6 +1,7 @@
 #include "ui.h"
 #include "can_stats.h"
 #include "log_player.h"
+#include "can_time.h"
 #include <string.h>
 
 LV_FONT_DECLARE(lv_font_cansight_14);
@@ -38,6 +39,8 @@ static lv_obj_t *preview_count_label;
 static lv_obj_t *storage_label;
 static lv_obj_t *delete_button;
 static lv_obj_t *delete_dialog;
+static lv_obj_t *frame_previous;
+static lv_obj_t *frame_next;
 static char delete_target[CAN_LOG_ARCHIVE_NAME_SIZE];  // 弹窗打开时固定目标，确认后不重新取当前选中项。
 static uint32_t displayed_player_revision;
 static bool player_display_valid;
@@ -55,7 +58,22 @@ typedef struct {
 } ui_filter_t;
 
 static ui_filter_t receive_filter;
+static ui_filter_t history_filter;
 static lv_obj_t *hex_keyboard;
+static ui_filter_t *keyboard_filter;
+
+static void refresh_player(void);
+static bool parse_filter(const char *text, uint32_t *id, bool *all);
+
+// 历史筛选通过 Apply 或键盘确认提交，输入过程中不反复扫描文件。
+static bool history_filter_applied(void)
+{
+    uint32_t id;
+    bool all;
+    const LogPlayerView *view = LogPlayer_GetView();
+    return parse_filter(history_filter.text, &id, &all) &&
+        view->filter_enabled == !all && (all || view->filter_id == id);
+}
 
 static bool parse_filter(const char *text, uint32_t *id, bool *all)
 {
@@ -123,9 +141,7 @@ static void refresh_receive(ui_filter_t *filter)
         lv_table_set_cell_value(filter->table, row, 3, text);
         // 使用整数运算将微秒转换为毫秒，并保留三位小数。
         if(entry->has_period) {
-            lv_snprintf(text, sizeof(text), "%lu.%03lu",
-                        (unsigned long)(entry->period_us / 1000U),
-                        (unsigned long)(entry->period_us % 1000U));
+            CanTime_FormatFixed(text, entry->period_us, 1000U, 3U);
         }
         else lv_snprintf(text, sizeof(text), "--");
         lv_table_set_cell_value(filter->table, row, 4, text);
@@ -144,7 +160,17 @@ static void refresh_receive(ui_filter_t *filter)
 
 static void refresh_filter(ui_filter_t *filter)
 {
-    refresh_receive(filter);
+    if(filter == &history_filter) {
+        uint32_t id;
+        bool all;
+        bool valid = parse_filter(filter->text, &id, &all);
+        lv_obj_set_style_border_color(filter->input,
+            lv_color_hex(valid ? UI_COLOR_LINE : 0xE35B5B), LV_PART_MAIN);
+        if(valid) LogPlayer_SetFilter(id, !all);
+        player_display_valid = false;
+        refresh_player();
+    }
+    else refresh_receive(filter);
 }
 
 static void close_hex_keyboard(void)
@@ -159,13 +185,16 @@ static void close_hex_keyboard(void)
 
 static void keyboard_done_cb(lv_event_t *event)
 {
-    (void)event;
+    if(lv_event_get_code(event) == LV_EVENT_READY && keyboard_filter == &history_filter)
+        refresh_filter(&history_filter);
     close_hex_keyboard();
+    keyboard_filter = NULL;
 }
 
 static void filter_clicked_cb(lv_event_t *event)
 {
     ui_filter_t *filter = lv_event_get_user_data(event);
+    keyboard_filter = filter;
     static const char * const map[] = {
         "1", "2", "3", "A", "B", "\n",
         "4", "5", "6", "C", "D", "\n",
@@ -197,6 +226,16 @@ static void filter_changed_cb(lv_event_t *event)
 {
     ui_filter_t *filter = lv_event_get_user_data(event);
     lv_snprintf(filter->text, sizeof(filter->text), "%s", lv_textarea_get_text(filter->input));
+    if(filter == &history_filter) {
+        uint32_t id;
+        bool all;
+        bool valid = parse_filter(filter->text, &id, &all);
+        lv_obj_set_style_border_color(filter->input,
+            lv_color_hex(valid ? UI_COLOR_LINE : 0xE35B5B), LV_PART_MAIN);
+        player_display_valid = false;
+        refresh_player();
+        return;
+    }
     // 筛选条件变更后重置分页，并立即更新显示。
     receive_offset = 0;
     refresh_filter(filter);
@@ -353,6 +392,7 @@ static void show_page(bool show_playback)
             lv_obj_delete(playback_page);
             playback_page = NULL;
             archive_notice = active_log_label = NULL;
+            history_filter.input = history_filter.table = history_filter.matches = NULL;
             LogPlayer_SetActive(0U);
         }
         if(receive_page == NULL) {
@@ -453,9 +493,19 @@ static void refresh_player(void)
     lv_label_set_text_fmt(selected_size_label, "%lu B", (unsigned long)view->selected_size);
     uint32_t color = UI_COLOR_MUTED;
     switch(view->preview_state) {
-        case LOG_PREVIEW_LOADING: lv_label_set_text(preview_status_label, "Reading first frames..."); break;
-        case LOG_PREVIEW_READY: lv_label_set_text(preview_status_label, "Preview ready"); break;
-        case LOG_PREVIEW_EMPTY: lv_label_set_text(preview_status_label, "Empty log (no frames)"); break;
+        case LOG_PREVIEW_INDEXING:
+            lv_label_set_text_fmt(preview_status_label, "Indexing %lu%% | %lu frames | %lu matches",
+                (unsigned long)(view->selected_size ? (uint64_t)view->scanned_bytes * 100U / view->selected_size : 0U),
+                (unsigned long)view->total_frames, (unsigned long)view->matched_frames);
+            break;
+        case LOG_PREVIEW_LOADING: lv_label_set_text(preview_status_label, "Locating frame..."); break;
+        case LOG_PREVIEW_READY:
+            lv_label_set_text(preview_status_label, view->legacy_time ?
+                "Ready | legacy 32-bit time: wraps inferred" : "Ready | 64-bit capture time");
+            break;
+        case LOG_PREVIEW_EMPTY:
+            lv_label_set_text(preview_status_label, view->total_frames ? "No matching frames" : "Empty log (no frames)");
+            break;
         case LOG_PREVIEW_FORMAT_ERROR:
             lv_label_set_text_fmt(preview_status_label, "CSV format error at line %lu",
                                  (unsigned long)view->line_number);
@@ -478,7 +528,17 @@ static void refresh_player(void)
             break;
     }
     lv_obj_set_style_text_color(preview_status_label, lv_color_hex(color), LV_PART_MAIN);
-    lv_label_set_text_fmt(preview_count_label, "First %u frames (preview only)", (unsigned)view->frame_count);
+    lv_label_set_text_fmt(preview_count_label, "Match %lu/%lu | frame %lu/%lu",
+        (unsigned long)(view->frame_count ? view->first_match + 1U : 0U),
+        (unsigned long)view->matched_frames,
+        (unsigned long)(view->frame_count ? view->frame_numbers[0] : 0U),
+        (unsigned long)view->total_frames);
+    bool applied = history_filter_applied();
+    if(!applied) lv_label_set_text(preview_count_label, "Edit ID, then press Apply");
+    bool navigating = applied && view->index_ready && view->preview_state == LOG_PREVIEW_READY &&
+        view->delete_state != LOG_DELETE_PENDING;
+    lv_obj_set_disabled(frame_previous, !navigating || view->first_match == 0U);
+    lv_obj_set_disabled(frame_next, !navigating || view->first_match + 1U >= view->matched_frames);
     lv_obj_set_style_text_color(preview_count_label, lv_color_hex(UI_COLOR_MUTED), LV_PART_MAIN);
     switch(view->delete_state) {
         case LOG_DELETE_PENDING:
@@ -519,8 +579,7 @@ static void refresh_player(void)
     for(unsigned i = 0; i < view->frame_count; i++) {
         const CanFrame *frame = &view->frames[i];
         char text[32];
-        lv_snprintf(text, sizeof(text), "%lu.%06lu", (unsigned long)(frame->timestamp_us / 1000000U),
-                    (unsigned long)(frame->timestamp_us % 1000000U));
+        CanTime_FormatFixed(text, frame->timestamp_us, 1000000U, 6U);
         lv_table_set_cell_value(preview_table, i + 1U, 0, text);
         lv_snprintf(text, sizeof(text), "0x%lX", (unsigned long)frame->id);
         lv_table_set_cell_value(preview_table, i + 1U, 1, text);
@@ -560,6 +619,29 @@ static void history_refresh_cb(lv_event_t *event)
     refresh_player();
 }
 
+static void history_filter_apply_cb(lv_event_t *event)
+{
+    (void)event;
+    close_hex_keyboard();
+    refresh_filter(&history_filter);
+}
+
+static void history_step_cb(lv_event_t *event)
+{
+    if(history_filter_applied()) LogPlayer_RequestStep((int)(intptr_t)lv_event_get_user_data(event));
+    refresh_player();
+}
+
+// 使用本地 LVGL 的绘制任务接口标出当前帧，不为每一行创建独立控件。
+static void history_table_draw_cb(lv_event_t *event)
+{
+    lv_draw_fill_dsc_t *fill = lv_draw_task_get_fill_dsc(lv_event_get_draw_task(event));
+    if(fill != NULL && fill->base.part == LV_PART_ITEMS && fill->base.id1 == 1U &&
+       LogPlayer_GetView()->preview_state == LOG_PREVIEW_READY) {
+        fill->color = lv_color_hex(0x293B52);
+    }
+}
+
 // 确认按钮仅提交固定目标的删除请求，文件系统操作由主循环处理。
 static void delete_confirm_cb(lv_event_t *event)
 {
@@ -578,6 +660,7 @@ static void history_delete_cb(lv_event_t *event)
     const LogPlayerView *view = LogPlayer_GetView();
     if(delete_dialog != NULL || view->selected_name[0] == '\0' ||
        view->delete_state == LOG_DELETE_PENDING) return;
+    close_hex_keyboard();
     lv_snprintf(delete_target, sizeof(delete_target), "%s", view->selected_name);
     // 顶层遮罩拦截背景操作，防止确认期间切换文件或重复归档。
     delete_dialog = lv_obj_create(lv_layer_top());
@@ -760,7 +843,7 @@ static void create_receive_page(lv_obj_t *screen)
     bind_filter(&receive_filter, filter, clear, table, matches);
 }
 
-// 创建历史文件选择和前五帧预览页面；逐帧导航及播放控制在后续阶段接入。
+// 创建历史文件管理及逐帧浏览页面，窗口首行为当前帧，最多显示五个匹配结果。
 static void create_playback_page(lv_obj_t *screen)
 {
     playback_page = lv_obj_create(screen);
@@ -802,14 +885,30 @@ static void create_playback_page(lv_obj_t *screen)
 
     selected_file_label = create_label(playback_page, "", 216, 4, 420, lv_color_hex(UI_COLOR_TEXT), 0);
     selected_size_label = create_label(playback_page, "", 650, 4, 135, lv_color_hex(UI_COLOR_MUTED), 0);
-    preview_status_label = create_label(playback_page, "", 216, 28, 570, lv_color_hex(UI_COLOR_MUTED), 0);
-    archive_notice = create_label(playback_page, "", 216, 52, 570, lv_color_hex(UI_COLOR_MUTED), 0);
-    active_log_label = create_label(playback_page, "", 216, 76, 570, lv_color_hex(UI_COLOR_MUTED), 0);
-    storage_label = create_label(playback_page, "", 216, 100, 570, lv_color_hex(UI_COLOR_MUTED), 0);
-    preview_count_label = create_label(playback_page, "", 216, 128, 440, lv_color_hex(UI_COLOR_MUTED), 0);
-    lv_label_set_long_mode(preview_count_label, LV_LABEL_LONG_MODE_DOTS);
-    delete_button = create_button(playback_page, "Delete file", 670, 120, 116, 30, false);
+    preview_status_label = create_label(playback_page, "", 216, 24, 570, lv_color_hex(UI_COLOR_MUTED), 0);
+    archive_notice = create_label(playback_page, "", 216, 44, 570, lv_color_hex(UI_COLOR_MUTED), 0);
+    active_log_label = create_label(playback_page, "", 216, 64, 570, lv_color_hex(UI_COLOR_MUTED), 0);
+    storage_label = create_label(playback_page, "", 216, 84, 570, lv_color_hex(UI_COLOR_MUTED), 0);
+    create_label(playback_page, "ID", 216, 111, 26, lv_color_hex(UI_COLOR_MUTED), 0);
+    lv_obj_t *filter = lv_textarea_create(playback_page);
+    lv_obj_set_pos(filter, 246, 104);
+    lv_obj_set_size(filter, 156, 32);
+    lv_textarea_set_one_line(filter, true);
+    lv_textarea_set_placeholder_text(filter, "例如 0x237");
+    lv_obj_set_style_pad_ver(filter, 5, LV_PART_MAIN);
+    lv_obj_set_style_bg_color(filter, lv_color_hex(0x101318), LV_PART_MAIN);
+    lv_obj_set_style_text_color(filter, lv_color_hex(UI_COLOR_TEXT), LV_PART_MAIN);
+    lv_obj_t *apply = create_button(playback_page, "Apply", 410, 104, 70, 32, false);
+    lv_obj_t *clear = create_button(playback_page, "Clear", 488, 104, 70, 32, false);
+    lv_obj_add_event_cb(apply, history_filter_apply_cb, LV_EVENT_CLICKED, NULL);
+    delete_button = create_button(playback_page, "Delete file", 670, 104, 116, 32, false);
     lv_obj_add_event_cb(delete_button, history_delete_cb, LV_EVENT_CLICKED, NULL);
+    frame_previous = create_button(playback_page, "Prev frame", 216, 140, 110, 30, false);
+    frame_next = create_button(playback_page, "Next frame", 334, 140, 110, 30, false);
+    lv_obj_add_event_cb(frame_previous, history_step_cb, LV_EVENT_CLICKED, (void *)(intptr_t)-1);
+    lv_obj_add_event_cb(frame_next, history_step_cb, LV_EVENT_CLICKED, (void *)(intptr_t)1);
+    preview_count_label = create_label(playback_page, "", 454, 147, 332, lv_color_hex(UI_COLOR_MUTED), 0);
+    lv_label_set_long_mode(preview_count_label, LV_LABEL_LONG_MODE_DOTS);
     lv_label_set_long_mode(selected_file_label, LV_LABEL_LONG_MODE_DOTS);
     lv_label_set_long_mode(preview_status_label, LV_LABEL_LONG_MODE_DOTS);
     lv_label_set_long_mode(archive_notice, LV_LABEL_LONG_MODE_DOTS);
@@ -817,17 +916,22 @@ static void create_playback_page(lv_obj_t *screen)
 
     preview_table = lv_table_create(playback_page);
     style_data_table(preview_table);
-    lv_obj_set_pos(preview_table, 204, 156);
-    lv_obj_set_size(preview_table, 584, 176);
+    lv_obj_set_send_draw_task_events(preview_table, true);
+    lv_obj_add_event_cb(preview_table, history_table_draw_cb, LV_EVENT_DRAW_TASK_ADDED, NULL);
+    lv_obj_set_style_pad_ver(preview_table, 4, LV_PART_ITEMS);
+    lv_obj_set_pos(preview_table, 204, 176);
+    lv_obj_set_size(preview_table, 584, 156);
     lv_table_set_column_count(preview_table, 5);
     lv_table_set_row_count(preview_table, 1);
-    const uint16_t widths[] = {90, 120, 100, 45, 225};
+    // DLC 列包含左右内边距，保留足够宽度，防止表头再次折成多行。
+    const uint16_t widths[] = {110, 110, 95, 48, 217};
     const char *headers[] = {"时间(s)", "CAN-ID", "类型", "DLC", "Data"};
     for(unsigned i = 0; i < 5U; i++) {
         lv_table_set_column_width(preview_table, i, widths[i]);
         lv_table_set_cell_value(preview_table, 0, i, headers[i]);
     }
     player_display_valid = false;
+    bind_filter(&history_filter, filter, clear, preview_table, preview_count_label);
     refresh_archive(CanStats_GetRuntime());
     refresh_player();
 }

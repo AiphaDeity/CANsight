@@ -1,4 +1,5 @@
 #include <stdint.h>
+#include <windows.h>
 
 #include "lvgl.h"
 #include "lvgl/drivers/windows/lv_windows_display.h"
@@ -28,7 +29,10 @@ static void simulate_can_cb(lv_timer_t *timer)
     };
     // 各模拟报文的生成间隔，单位为毫秒，索引与 frames 保持一致。
     static const uint32_t intervals_ms[] = {1000,10,20,50,100,200,500,1000,500};
-    uint32_t now_us = lv_tick_get() * 1000U;  // 转换为与固件一致的 32 位微秒时间戳。
+    static uint64_t start_ms;
+    uint64_t now_ms = GetTickCount64();
+    if(!start_ms) start_ms = now_ms;
+    uint64_t now_us = (now_ms - start_ms) * 1000ULL;  // 模拟器启动后的 64 位微秒基准。
     for(unsigned i = 0; i < sizeof(frames) / sizeof(frames[0]); i++) {
         if(now_us - frames[i].timestamp_us >= intervals_ms[i] * 1000U) {
             // 到期后生成一帧并更新基准时间，不补发调度延迟期间的报文。

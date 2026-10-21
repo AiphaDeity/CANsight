@@ -1,4 +1,5 @@
 #include "can_logger.h"
+#include "can_time.h"
 
 #include "fatfs.h"
 #include "main.h"
@@ -12,7 +13,8 @@
 #define CAN_LOG_FILE_NAME         "CANLOG.CSV"  //日志文件名
 #define CAN_LOG_ARCHIVE_MAX       999999999U
 
-static const char csvHeader[] = "timestamp_us,format,type,id,dlc,data_hex\r\n";
+static const char csvHeader[] = "timestamp_us64,format,type,id,dlc,data_hex\r\n";
+static const char legacyHeader[] = "timestamp_us,format,type,id,dlc,data_hex\r\n";
 static CanArchiveState archiveState = CAN_ARCHIVE_IDLE;
 static char lastArchiveName[CAN_LOG_ARCHIVE_NAME_SIZE];
 static uint32_t nextArchiveNumber = 1U;
@@ -146,7 +148,7 @@ static FRESULT CanLogger_ArchivePrevious(void)
   if(result != FR_OK) return result;
   if((info.fattrib & AM_DIR) != 0U) return FR_DENIED;
   if(info.fsize == 0U) return FR_OK;
-  if(info.fsize == sizeof(csvHeader) - 1U) {
+  if(info.fsize == sizeof(csvHeader) - 1U || info.fsize == sizeof(legacyHeader) - 1U) {
     UINT bytesRead = 0U;
     result = f_open(&logFile, path, FA_READ);
     if(result != FR_OK) return result;
@@ -154,7 +156,10 @@ static FRESULT CanLogger_ArchivePrevious(void)
     FRESULT closeResult = f_close(&logFile);
     if(result != FR_OK) return result;
     if(closeResult != FR_OK) return closeResult;
-    if(bytesRead == sizeof(header) && memcmp(header, csvHeader, sizeof(header)) == 0) {
+    if((bytesRead == sizeof(header) && memcmp(header, csvHeader, sizeof(header)) == 0) ||
+       (bytesRead == sizeof(legacyHeader) - 1U && memcmp(header, legacyHeader, bytesRead) == 0)) {
+      // 旧版仅含表头的活动文件可删除后重建，不能沿用旧表头写入新时间格式。
+      if(info.fsize == sizeof(legacyHeader) - 1U) return f_unlink(path);
       return FR_OK;
     }
   }
@@ -294,8 +299,10 @@ void CanLogger_AddFrame(const CanFrame *frame)
     return;
   }
 
-  rowLength = snprintf(row, sizeof(row), "%lu,%s,%s,0x%lX,%u,",
-                      (unsigned long)frame->timestamp_us,
+  char timestamp[21];
+  CanTime_FormatUnsigned(timestamp, frame->timestamp_us);
+  rowLength = snprintf(row, sizeof(row), "%s,%s,%s,0x%lX,%u,",
+                      timestamp,
                       (frame->ide == CAN_ID_STD) ? "STD" : "EXT",
                       (frame->rtr == CAN_RTR_DATA) ? "DATA" : "REMOTE",
                       (unsigned long)frame->id,

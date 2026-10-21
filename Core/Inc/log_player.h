@@ -15,6 +15,7 @@ typedef enum {
 
 typedef enum {
     LOG_PREVIEW_IDLE = 0,
+    LOG_PREVIEW_INDEXING,
     LOG_PREVIEW_LOADING,
     LOG_PREVIEW_READY,
     LOG_PREVIEW_EMPTY,
@@ -43,7 +44,7 @@ typedef struct {
     uint32_t number;
 } LogHistoryFile;
 
-// 只保存当前文件列表页及开头五帧，内存占用与目录和日志大小无关。
+// 只保存当前文件列表页及最多五帧的浏览窗口，内存占用不随日志大小增长。
 typedef struct {
     uint32_t revision;          // 可见数据版本，供界面跳过无变化的刷新。
     LogListState list_state;
@@ -58,7 +59,16 @@ typedef struct {
     LogHistoryFile files[LOG_PLAYER_PAGE_SIZE];
     uint8_t file_count;
     CanFrame frames[LOG_PLAYER_PREVIEW_ROWS];
-    uint8_t frame_count;        // 已加载的预览帧数，不代表文件总帧数。
+    uint8_t frame_count;
+    uint8_t index_ready;        // 完整扫描并校验文件后才允许逐帧导航。
+    uint8_t legacy_time;        // 旧版 32 位时间日志，仅可按可观察的下降展开回绕。
+    uint8_t filter_enabled;
+    uint32_t filter_id;
+    uint32_t total_frames;      // 全文件报文数量，不受 ID 筛选影响。
+    uint32_t matched_frames;
+    uint32_t first_match;       // 当前窗口首帧在匹配结果中的位置，从 0 开始。
+    uint32_t frame_numbers[LOG_PLAYER_PREVIEW_ROWS];  // 每行在原文件中的报文序号，从 1 开始。
+    uint32_t scanned_bytes;
     LogStorageState storage_state;
     uint32_t storage_error;
     uint64_t total_bytes;       // 文件系统可用数据区总容量，不是存储介质标称容量。
@@ -79,6 +89,10 @@ void LogPlayer_Init(const char *root);
 void LogPlayer_RequestRefresh(void);
 void LogPlayer_RequestPage(int direction);
 void LogPlayer_RequestOpen(const char *name);
+// ID 按数值精确匹配，同时包含同 ID 的标准/扩展及数据/远程帧。
+uint8_t LogPlayer_SetFilter(uint32_t id, uint8_t enabled);
+// 负数向前移动一帧，正数向后移动一帧；边界或扫描期间忽略请求。
+void LogPlayer_RequestStep(int direction);
 // 仅受理当前选中的规范历史文件；调用方必须先取得用户的删除确认。
 uint8_t LogPlayer_RequestDelete(const char *name);
 void LogPlayer_SetActive(uint8_t active);

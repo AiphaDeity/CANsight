@@ -43,9 +43,7 @@ void CanStats_AddFrame(const CanFrame *frame)
 
     CanStatsEntry *entry = &entries[index];
     if(entry->count != 0U) {
-        /* 在覆盖旧报文前计算接收间隔。无符号减法支持跨一次 TIM2 回绕，
-         * 前提是相邻两帧间隔小于 2^32 微秒，约 71.6 分钟。
-         */
+        // 采集端已展开 TIM2 回绕，较长的报文间隔不会截断为 32 位。
         entry->period_us = frame->timestamp_us - entry->latest.timestamp_us;
         entry->has_period = 1U;
     }
