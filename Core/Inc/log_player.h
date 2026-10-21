@@ -22,6 +22,20 @@ typedef enum {
     LOG_PREVIEW_IO_ERROR
 } LogPreviewState;
 
+typedef enum {
+    LOG_STORAGE_IDLE = 0,
+    LOG_STORAGE_LOADING,
+    LOG_STORAGE_READY,
+    LOG_STORAGE_ERROR
+} LogStorageState;
+
+typedef enum {
+    LOG_DELETE_IDLE = 0,
+    LOG_DELETE_PENDING,
+    LOG_DELETE_DONE,
+    LOG_DELETE_ERROR
+} LogDeleteState;
+
 // 文件名仅接受本项目生成的归档命名格式，禁止选择活动日志或任意路径。
 typedef struct {
     char name[CAN_LOG_ARCHIVE_NAME_SIZE];
@@ -45,6 +59,13 @@ typedef struct {
     uint8_t file_count;
     CanFrame frames[LOG_PLAYER_PREVIEW_ROWS];
     uint8_t frame_count;        // 已加载的预览帧数，不代表文件总帧数。
+    LogStorageState storage_state;
+    uint32_t storage_error;
+    uint64_t total_bytes;       // 文件系统可用数据区总容量，不是存储介质标称容量。
+    uint64_t free_bytes;        // 最近一次容量查询结果，不包含尚未写入的 RAM 缓冲。
+    LogDeleteState delete_state;
+    uint32_t delete_error;
+    char delete_name[CAN_LOG_ARCHIVE_NAME_SIZE];  // 确认时锁定的目标，不随选中文件变化。
 } LogPlayerView;
 
 /**
@@ -58,6 +79,8 @@ void LogPlayer_Init(const char *root);
 void LogPlayer_RequestRefresh(void);
 void LogPlayer_RequestPage(int direction);
 void LogPlayer_RequestOpen(const char *name);
+// 仅受理当前选中的规范历史文件；调用方必须先取得用户的删除确认。
+uint8_t LogPlayer_RequestDelete(const char *name);
 void LogPlayer_SetActive(uint8_t active);
 void LogPlayer_Process(void);
 uint8_t LogPlayer_IsBusy(void);

@@ -7,6 +7,7 @@
 // 读取流程：界面提交请求，主循环分批访问文件系统，结果通过 view 提供给界面。
 // 两个平台共用目录分页和 CSV 解析，仅文件、目录访问接口不同。
 #ifdef CAN_PLAYER_SIMULATOR
+#include <windows.h>
 #include <io.h>
 #include <errno.h>
 static FILE *reader;                         // 模拟器当前打开的只读文件。
@@ -27,6 +28,7 @@ static uint32_t close_error;  // 资源关闭失败后暂停文件访问，避�
 static uint8_t active;                      // 历史页激活标志，关闭页面后停止读取。
 static uint8_t query_pending;               // 等待主循环受理的目录扫描请求。
 static uint8_t open_pending;                // 等待主循环受理的文件打开请求。
+static uint8_t storage_pending;             // 仅在进入、刷新或文件变更后查询容量。
 static uint8_t directory_open;              // 目录对象是否处于打开状态。
 static uint8_t reader_open;                 // 历史文件是否处于打开状态。
 static uint8_t header_seen;                 // 当前文件的 CSV 表头是否已通过校验。
@@ -111,7 +113,7 @@ void LogPlayer_Init(const char *root)
     snprintf(root_path, sizeof(root_path), "%s", root_valid ? root : "");
     close_error = 0U;
     view.revision = 1U;  // 使用非零初始版本，使界面可以识别初始化后的数据。
-    active = query_pending = open_pending = 0U;
+    active = query_pending = open_pending = storage_pending = 0U;
 #ifndef CAN_PLAYER_SIMULATOR
     archive_revision = CanLogger_GetArchiveRevision();
 #endif
@@ -121,15 +123,22 @@ void LogPlayer_Init(const char *root)
 void LogPlayer_SetActive(uint8_t enabled)
 {
     active = enabled;
-    if(!enabled) query_pending = open_pending = 0U;
+    if(!enabled) {
+        query_pending = open_pending = storage_pending = 0U;
+        // 尚未执行的删除随页面退出取消，已完成的操作不受影响。
+        if(view.delete_state == LOG_DELETE_PENDING) view.delete_state = LOG_DELETE_IDLE;
+    }
 }
 
 // 请求重新扫描首页，不改变当前选中文件及已经完成的预览内容。
 void LogPlayer_RequestRefresh(void)
 {
+    if(view.delete_state == LOG_DELETE_PENDING) return;
     if(close_error != 0U) {
         view.list_state = LOG_LIST_ERROR;
         view.list_error = close_error;
+        view.storage_state = LOG_STORAGE_ERROR;
+        view.storage_error = close_error;
         view.revision++;
         return;
     }
@@ -137,6 +146,8 @@ void LogPlayer_RequestRefresh(void)
     query_direction = 0;
     query_anchor = requested_page = 0U;
     query_pending = 1U;
+    storage_pending = 1U;
+    view.storage_state = LOG_STORAGE_LOADING;
     view.list_state = LOG_LIST_SCANNING;
     view.revision++;
 }
@@ -148,6 +159,7 @@ void LogPlayer_RequestRefresh(void)
  */
 void LogPlayer_RequestPage(int direction)
 {
+    if(view.delete_state == LOG_DELETE_PENDING) return;
     if(close_error != 0U) { LogPlayer_RequestRefresh(); return; }
     if(view.list_state != LOG_LIST_READY || view.file_count == 0U) return;
     if(direction < 0) {
@@ -170,6 +182,7 @@ void LogPlayer_RequestPage(int direction)
 // 校验并复制文件名，立即清除旧预览，实际关闭和打开操作延后至主循环。
 void LogPlayer_RequestOpen(const char *name)
 {
+    if(view.delete_state == LOG_DELETE_PENDING) return;
     if(name == NULL || archive_number(name) == 0U) return;
     if(close_error != 0U) {
         view.preview_state = LOG_PREVIEW_IO_ERROR;
@@ -179,9 +192,117 @@ void LogPlayer_RequestOpen(const char *name)
     }
     active = 1U;
     snprintf(view.selected_name, sizeof(view.selected_name), "%s", name);
+    view.delete_state = LOG_DELETE_IDLE;
     view.preview_state = LOG_PREVIEW_LOADING;
     view.preview_error = view.frame_count = view.line_number = view.selected_size = 0U;
     open_pending = 1U;
+    view.revision++;
+}
+
+// 请求中锁定已确认的历史文件名；不允许活动日志、任意路径或重复提交。
+uint8_t LogPlayer_RequestDelete(const char *name)
+{
+    if(!active || !root_valid || close_error || name == NULL ||
+       archive_number(name) == 0U || strcmp(name, view.selected_name) != 0 ||
+       view.delete_state == LOG_DELETE_PENDING) return 0U;
+    snprintf(view.delete_name, sizeof(view.delete_name), "%s", name);
+    view.delete_error = 0U;
+    view.delete_state = LOG_DELETE_PENDING;
+    view.revision++;
+    return 1U;
+}
+
+#ifdef CAN_PLAYER_SIMULATOR
+// 本机错误转换为共用界面使用的 FRESULT 数值，不暴露平台相关错误编号。
+static uint32_t windows_error(void)
+{
+    switch(GetLastError()) {
+        case ERROR_FILE_NOT_FOUND: return 4U;
+        case ERROR_PATH_NOT_FOUND: return 5U;
+        case ERROR_ACCESS_DENIED: case ERROR_DISK_FULL: return 7U;
+        case ERROR_WRITE_PROTECT: return 10U;
+        case ERROR_SHARING_VIOLATION: case ERROR_LOCK_VIOLATION: return 16U;
+        case ERROR_NOT_READY: return 3U;
+        default: return 1U;
+    }
+}
+#endif
+
+// 容量查询独立于目录、预览和写入状态；失败时不使用上次结果冒充当前容量。
+static void read_storage(void)
+{
+    storage_pending = 0U;
+    uint32_t error = 0U;
+    view.total_bytes = view.free_bytes = 0U;
+    if(!root_valid) error = 6U;
+#ifdef CAN_PLAYER_SIMULATOR
+    else {
+        ULARGE_INTEGER available, total, free_space;
+        if(!GetDiskFreeSpaceExA(root_path, &available, &total, &free_space)) error = windows_error();
+        else {
+            view.total_bytes = total.QuadPart;
+            view.free_bytes = available.QuadPart;
+        }
+    }
+#else
+    else {
+        DWORD free_clusters;
+        FATFS *filesystem;
+        error = (uint32_t)f_getfree(root_path, &free_clusters, &filesystem);
+        if(error == 0U) {
+            // 可变扇区配置必须读取卷的实际扇区大小，并在乘法前扩展至 64 位。
+#if _MAX_SS != _MIN_SS
+            uint32_t sector_size = filesystem->ssize;
+#else
+            uint32_t sector_size = _MIN_SS;
+#endif
+            uint64_t cluster_bytes = (uint64_t)filesystem->csize * sector_size;
+            view.total_bytes = (uint64_t)(filesystem->n_fatent - 2U) * cluster_bytes;
+            view.free_bytes = (uint64_t)free_clusters * cluster_bytes;
+        }
+    }
+#endif
+    view.storage_error = error;
+    view.storage_state = error ? LOG_STORAGE_ERROR : LOG_STORAGE_READY;
+    view.revision++;
+}
+
+// 删除仅在主循环执行；先关闭扫描和读取资源，再检查目标属性并删除。
+static void delete_history(void)
+{
+    query_pending = open_pending = 0U;
+    uint32_t error = close_reader();
+    uint32_t directory_error = close_directory();
+    if(!error) error = directory_error;
+    char path[320];
+    snprintf(path, sizeof(path), "%s/%s", root_path, view.delete_name);
+    if(!error) {
+#ifdef CAN_PLAYER_SIMULATOR
+        DWORD attributes = GetFileAttributesA(path);
+        if(attributes == INVALID_FILE_ATTRIBUTES) error = windows_error();
+        else if(attributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT)) error = 7U;
+        else if(!DeleteFileA(path)) error = windows_error();
+#else
+        FILINFO info;
+        error = (uint32_t)f_stat(path, &info);
+        // 同名目录不可删除，活动文件已由请求接口的名称检查排除。
+        if(!error && (info.fattrib & AM_DIR)) error = (uint32_t)FR_DENIED;
+        if(!error) error = (uint32_t)f_unlink(path);
+#endif
+    }
+    view.delete_error = error;
+    view.delete_state = error ? LOG_DELETE_ERROR : LOG_DELETE_DONE;
+    if(!error) {
+        view.selected_name[0] = '\0';
+        view.selected_size = view.frame_count = view.line_number = view.preview_error = 0U;
+        view.preview_state = LOG_PREVIEW_IDLE;
+    }
+    else if(view.preview_state == LOG_PREVIEW_LOADING) {
+        view.preview_state = LOG_PREVIEW_IO_ERROR;
+        view.preview_error = error;
+    }
+    // 删除失败保留选中项及已读取数据；重新扫描实际目录，避免展示已失效的条目。
+    LogPlayer_RequestRefresh();
     view.revision++;
 }
 
@@ -471,13 +592,18 @@ static void read_preview(void)
 
 /**
  * @brief 在日志写入之后推进目录扫描或文件预览。
- * @note 请求接口不执行文件操作；每轮仅推进一个有限批次，避免持续占用主循环。
+ * @note 目录和预览按有限批次执行；容量查询及删除使用同步接口，可能短暂阻塞主循环。
  */
 void LogPlayer_Process(void)
 {
     if(close_error != 0U) {
         // 资源关闭失败后不继续覆盖文件对象，需复位重新初始化。
-        query_pending = open_pending = 0U;
+        query_pending = open_pending = storage_pending = 0U;
+        if(view.storage_state == LOG_STORAGE_LOADING) {
+            view.storage_state = LOG_STORAGE_ERROR;
+            view.storage_error = close_error;
+            view.revision++;
+        }
         return;
     }
     if(!active) {
@@ -502,24 +628,37 @@ void LogPlayer_Process(void)
     }
     if(CanLogger_GetState() == CAN_LOG_UNMOUNTED) {
         // 日志未挂载时拒绝文件访问，但不更改日志模块自身的错误状态。
-        query_pending = open_pending = 0U;
+        query_pending = open_pending = storage_pending = 0U;
+        if(view.storage_state != LOG_STORAGE_ERROR || view.storage_error != 3U) {
+            view.storage_state = LOG_STORAGE_ERROR;
+            view.storage_error = 3U;
+            view.revision++;
+        }
+        if(view.delete_state == LOG_DELETE_PENDING) {
+            view.delete_state = LOG_DELETE_ERROR;
+            view.delete_error = 3U;
+            view.revision++;
+        }
         if(view.list_state != LOG_LIST_ERROR) list_failed(3U);
         if(reader_open || view.preview_state == LOG_PREVIEW_LOADING) preview_failed(LOG_PREVIEW_IO_ERROR, 3U);
         return;
     }
 #endif
+    if(view.delete_state == LOG_DELETE_PENDING) { delete_history(); return; }
     // 新请求优先于旧任务；打开新文件时由 start_preview 统一结束旧读取。
     if(query_pending) { start_query(); return; }
     if(open_pending) { start_preview(); return; }
     // 每轮只执行一个扫描批次或一次读取，读取优先，避免用户选择后等待整个目录重扫。
     if(reader_open) read_preview();
     else if(directory_open) scan_directory();
+    else if(storage_pending) read_storage();
 }
 
 // 模拟器据此缩短空闲等待时间，不代表本模块使用独立线程。
 uint8_t LogPlayer_IsBusy(void)
 {
-    return active && !close_error && (query_pending || open_pending || directory_open || reader_open);
+    return active && !close_error && (query_pending || open_pending || directory_open || reader_open ||
+        storage_pending || view.delete_state == LOG_DELETE_PENDING);
 }
 
 // 返回内部数据的只读视图，界面不得修改或释放，后续 Process 可能更新其内容。

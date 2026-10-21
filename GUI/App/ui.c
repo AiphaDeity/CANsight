@@ -35,6 +35,10 @@ static lv_obj_t *selected_size_label;
 static lv_obj_t *preview_status_label;
 static lv_obj_t *preview_table;
 static lv_obj_t *preview_count_label;
+static lv_obj_t *storage_label;
+static lv_obj_t *delete_button;
+static lv_obj_t *delete_dialog;
+static char delete_target[CAN_LOG_ARCHIVE_NAME_SIZE];  // 弹窗打开时固定目标，确认后不重新取当前选中项。
 static uint32_t displayed_player_revision;
 static bool player_display_valid;
 static CanStatsRuntime displayed_runtime;
@@ -318,9 +322,19 @@ static void archive_event_cb(lv_event_t *event)
     request_archive();
 }
 
+// 弹窗可能从自身事件关闭，先隐藏并延后释放，避免事件处理期间访问已释放对象。
+static void close_delete_dialog(void)
+{
+    if(delete_dialog == NULL) return;
+    lv_obj_set_hidden(delete_dialog, true);
+    lv_obj_delete_async(delete_dialog);
+    delete_dialog = NULL;
+}
+
 static void show_page(bool show_playback)
 {
     close_hex_keyboard();
+    close_delete_dialog();
     // 两页不同时驻留，避免同时占用两张表格的 LVGL 动态内存。
     lv_obj_t *screen = lv_screen_active();
     if(show_playback) {
@@ -465,6 +479,42 @@ static void refresh_player(void)
     }
     lv_obj_set_style_text_color(preview_status_label, lv_color_hex(color), LV_PART_MAIN);
     lv_label_set_text_fmt(preview_count_label, "First %u frames (preview only)", (unsigned)view->frame_count);
+    lv_obj_set_style_text_color(preview_count_label, lv_color_hex(UI_COLOR_MUTED), LV_PART_MAIN);
+    switch(view->delete_state) {
+        case LOG_DELETE_PENDING:
+            lv_label_set_text_fmt(preview_count_label, "Deleting: %s", view->delete_name);
+            break;
+        case LOG_DELETE_DONE:
+            lv_label_set_text_fmt(preview_count_label, "Deleted: %s", view->delete_name);
+            break;
+        case LOG_DELETE_ERROR:
+            lv_label_set_text_fmt(preview_count_label, "Delete failed: %lu (%s)",
+                (unsigned long)view->delete_error, fatfs_error_name(view->delete_error));
+            lv_obj_set_style_text_color(preview_count_label, lv_color_hex(0xE35B5B), LV_PART_MAIN);
+            break;
+        default: break;
+    }
+    lv_obj_set_disabled(delete_button, view->selected_name[0] == '\0' ||
+        view->delete_state == LOG_DELETE_PENDING || view->list_state != LOG_LIST_READY);
+    lv_obj_set_style_text_color(storage_label, lv_color_hex(UI_COLOR_MUTED), LV_PART_MAIN);
+    if(view->storage_state == LOG_STORAGE_READY) {
+        // 使用二进制容量单位和整数格式化，避免引入浮点与 64 位 printf 支持。
+        uint64_t unit = 1024ULL * 1024ULL;
+        bool low = view->free_bytes < CAN_LOG_MAX_FILE_SIZE;
+        lv_label_set_text_fmt(storage_label, "%s%s free: %lu.%lu / %lu.%lu MiB",
+            low ? "LOW SPACE | " : "", archive_callback == NULL ? "Disk" : "SD",
+            (unsigned long)(view->free_bytes / unit),
+            (unsigned long)((view->free_bytes % unit) * 10U / unit),
+            (unsigned long)(view->total_bytes / unit),
+            (unsigned long)((view->total_bytes % unit) * 10U / unit));
+        if(low) lv_obj_set_style_text_color(storage_label, lv_color_hex(0xE3B34E), LV_PART_MAIN);
+    }
+    else if(view->storage_state == LOG_STORAGE_ERROR) {
+        lv_label_set_text_fmt(storage_label, "Capacity error: %lu (%s)",
+            (unsigned long)view->storage_error, fatfs_error_name(view->storage_error));
+        lv_obj_set_style_text_color(storage_label, lv_color_hex(0xE35B5B), LV_PART_MAIN);
+    }
+    else lv_label_set_text(storage_label, "Reading capacity...");
     lv_table_set_row_count(preview_table, view->frame_count + 1U);
     for(unsigned i = 0; i < view->frame_count; i++) {
         const CanFrame *frame = &view->frames[i];
@@ -508,6 +558,52 @@ static void history_refresh_cb(lv_event_t *event)
     (void)event;
     LogPlayer_RequestRefresh();
     refresh_player();
+}
+
+// 确认按钮仅提交固定目标的删除请求，文件系统操作由主循环处理。
+static void delete_confirm_cb(lv_event_t *event)
+{
+    bool confirm = lv_event_get_user_data(event) != NULL;
+    close_delete_dialog();
+    if(confirm && !LogPlayer_RequestDelete(delete_target)) {
+        lv_label_set_text(preview_count_label, "Delete cancelled: selection unavailable");
+        return;
+    }
+    refresh_player();
+}
+
+static void history_delete_cb(lv_event_t *event)
+{
+    (void)event;
+    const LogPlayerView *view = LogPlayer_GetView();
+    if(delete_dialog != NULL || view->selected_name[0] == '\0' ||
+       view->delete_state == LOG_DELETE_PENDING) return;
+    lv_snprintf(delete_target, sizeof(delete_target), "%s", view->selected_name);
+    // 顶层遮罩拦截背景操作，防止确认期间切换文件或重复归档。
+    delete_dialog = lv_obj_create(lv_layer_top());
+    lv_obj_set_size(delete_dialog, 800, 480);
+    lv_obj_set_pos(delete_dialog, 0, 0);
+    lv_obj_set_style_pad_all(delete_dialog, 0, LV_PART_MAIN);
+    lv_obj_set_style_border_width(delete_dialog, 0, LV_PART_MAIN);
+    lv_obj_set_style_radius(delete_dialog, 0, LV_PART_MAIN);
+    lv_obj_set_style_bg_color(delete_dialog, lv_color_hex(0x000000), LV_PART_MAIN);
+    lv_obj_set_style_bg_opa(delete_dialog, LV_OPA_60, LV_PART_MAIN);
+    lv_obj_set_scroll_dir(delete_dialog, LV_DIR_NONE);
+    lv_obj_t *panel = lv_obj_create(delete_dialog);
+    lv_obj_set_size(panel, 440, 210);
+    lv_obj_center(panel);
+    lv_obj_set_style_pad_all(panel, 0, LV_PART_MAIN);
+    lv_obj_set_style_bg_color(panel, lv_color_hex(UI_COLOR_PANEL), LV_PART_MAIN);
+    lv_obj_set_style_border_color(panel, lv_color_hex(UI_COLOR_LINE), LV_PART_MAIN);
+    lv_obj_set_scroll_dir(panel, LV_DIR_NONE);
+    create_label(panel, "Delete history file?", 20, 18, 400, lv_color_hex(UI_COLOR_TEXT), 0);
+    create_label(panel, delete_target, 20, 52, 400, lv_color_hex(UI_COLOR_TEXT), 0);
+    create_label(panel, "This cannot be undone.", 20, 86, 400, lv_color_hex(0xE3B34E), 0);
+    lv_obj_t *cancel = create_button(panel, "Cancel", 20, 142, 185, 42, false);
+    lv_obj_t *confirm = create_button(panel, "Delete", 230, 142, 185, 42, false);
+    lv_obj_set_style_bg_color(confirm, lv_color_hex(0xA83F3F), LV_PART_MAIN);
+    lv_obj_add_event_cb(cancel, delete_confirm_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_add_event_cb(confirm, delete_confirm_cb, LV_EVENT_CLICKED, delete_target);
 }
 
 static void refresh_runtime(void)
@@ -709,7 +805,11 @@ static void create_playback_page(lv_obj_t *screen)
     preview_status_label = create_label(playback_page, "", 216, 28, 570, lv_color_hex(UI_COLOR_MUTED), 0);
     archive_notice = create_label(playback_page, "", 216, 52, 570, lv_color_hex(UI_COLOR_MUTED), 0);
     active_log_label = create_label(playback_page, "", 216, 76, 570, lv_color_hex(UI_COLOR_MUTED), 0);
-    preview_count_label = create_label(playback_page, "", 216, 100, 570, lv_color_hex(UI_COLOR_MUTED), 0);
+    storage_label = create_label(playback_page, "", 216, 100, 570, lv_color_hex(UI_COLOR_MUTED), 0);
+    preview_count_label = create_label(playback_page, "", 216, 128, 440, lv_color_hex(UI_COLOR_MUTED), 0);
+    lv_label_set_long_mode(preview_count_label, LV_LABEL_LONG_MODE_DOTS);
+    delete_button = create_button(playback_page, "Delete file", 670, 120, 116, 30, false);
+    lv_obj_add_event_cb(delete_button, history_delete_cb, LV_EVENT_CLICKED, NULL);
     lv_label_set_long_mode(selected_file_label, LV_LABEL_LONG_MODE_DOTS);
     lv_label_set_long_mode(preview_status_label, LV_LABEL_LONG_MODE_DOTS);
     lv_label_set_long_mode(archive_notice, LV_LABEL_LONG_MODE_DOTS);
@@ -717,8 +817,8 @@ static void create_playback_page(lv_obj_t *screen)
 
     preview_table = lv_table_create(playback_page);
     style_data_table(preview_table);
-    lv_obj_set_pos(preview_table, 204, 124);
-    lv_obj_set_size(preview_table, 584, 208);
+    lv_obj_set_pos(preview_table, 204, 156);
+    lv_obj_set_size(preview_table, 584, 176);
     lv_table_set_column_count(preview_table, 5);
     lv_table_set_row_count(preview_table, 1);
     const uint16_t widths[] = {90, 120, 100, 45, 225};
