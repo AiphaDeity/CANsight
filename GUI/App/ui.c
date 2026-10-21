@@ -1,5 +1,6 @@
 #include "ui.h"
 #include "can_stats.h"
+#include "log_player.h"
 #include <string.h>
 
 LV_FONT_DECLARE(lv_font_cansight_14);
@@ -22,30 +23,27 @@ static lv_obj_t *sd_status_label;
 static lv_obj_t *diagnostics_label;
 static ui_archive_callback_t archive_callback;
 static lv_obj_t *archive_notice;
-static lv_obj_t *archive_name_label;
 static lv_obj_t *active_log_label;
+static lv_obj_t *file_buttons[LOG_PLAYER_PAGE_SIZE];
+static char file_button_names[LOG_PLAYER_PAGE_SIZE][CAN_LOG_ARCHIVE_NAME_SIZE];
+static lv_obj_t *list_status_label;
+static lv_obj_t *list_page_label;
+static lv_obj_t *list_previous;
+static lv_obj_t *list_next;
+static lv_obj_t *selected_file_label;
+static lv_obj_t *selected_size_label;
+static lv_obj_t *preview_status_label;
+static lv_obj_t *preview_table;
+static lv_obj_t *preview_count_label;
+static uint32_t displayed_player_revision;
+static bool player_display_valid;
 static CanStatsRuntime displayed_runtime;
 static bool runtime_display_valid;
 static uint32_t displayed_total;    // 上次刷新时的累计帧数。
 static uint16_t receive_offset;     // 当前页在筛选结果中的起始偏移。
 #define RECEIVE_VISIBLE_ROWS 8U  // 单页最大条目数，用于限制控件内存占用。
 
-// 回放页保留示例数据；接收页使用统计模块提供的数据。
 typedef struct {
-    uint32_t id;
-    const char *cells[6];
-} ui_sample_t;
-
-static const ui_sample_t playback_samples[] = {
-    {0x237, {"12.340", "0x237", "标准", "8", "12 27 65 74 83 92 87 33"}},
-    {0x123, {"12.352", "0x123", "标准", "4", "01 02 03 04"}},
-    {0x321, {"12.360", "0x321", "标准", "2", "A5 5A"}},
-    {0x18FEF100, {"12.371", "0x18FEF100", "扩展", "8", "FF FF FF 00 12 34 56 78"}},
-    {0x237, {"12.840", "0x237", "标准", "8", "12 27 65 74 83 92 87 34"}}
-};
-
-typedef struct {
-    bool playback;
     lv_obj_t *input;
     lv_obj_t *table;
     lv_obj_t *matches;
@@ -53,7 +51,6 @@ typedef struct {
 } ui_filter_t;
 
 static ui_filter_t receive_filter;
-static ui_filter_t playback_filter = {.playback = true};
 static lv_obj_t *hex_keyboard;
 
 static bool parse_filter(const char *text, uint32_t *id, bool *all)
@@ -143,38 +140,7 @@ static void refresh_receive(ui_filter_t *filter)
 
 static void refresh_filter(ui_filter_t *filter)
 {
-    if(!filter->playback) {
-        refresh_receive(filter);
-        return;
-    }
-    const ui_sample_t *samples = playback_samples;
-    uint32_t count = sizeof(playback_samples) / sizeof(playback_samples[0]);
-    uint32_t columns = 5;
-    uint32_t id;
-    bool all;
-    bool valid = parse_filter(filter->text, &id, &all);
-    uint32_t matches = 0;
-    for(uint32_t i = 0; i < count; i++) {
-        if(valid && (all || samples[i].id == id)) matches++;
-    }
-
-    lv_table_set_row_count(filter->table, matches + 1);
-    uint32_t row = 1;
-    for(uint32_t i = 0; i < count; i++) {
-        if(!valid || (!all && samples[i].id != id)) continue;
-        for(uint32_t col = 0; col < columns; col++) {
-            lv_table_set_cell_value(filter->table, row, col, samples[i].cells[col]);
-        }
-        row++;
-    }
-    lv_obj_scroll_to_y(filter->table, 0, LV_ANIM_OFF);
-    if(!valid) lv_label_set_text(filter->matches, "ID 格式错误");
-    else {
-        lv_label_set_text_fmt(filter->matches, "匹配 %u / 共 %u 帧",
-                             (unsigned)matches, (unsigned)count);
-    }
-    lv_obj_set_style_border_color(filter->input,
-                                  lv_color_hex(valid ? UI_COLOR_LINE : 0xE35B5B), LV_PART_MAIN);
+    refresh_receive(filter);
 }
 
 static void close_hex_keyboard(void)
@@ -228,7 +194,7 @@ static void filter_changed_cb(lv_event_t *event)
     ui_filter_t *filter = lv_event_get_user_data(event);
     lv_snprintf(filter->text, sizeof(filter->text), "%s", lv_textarea_get_text(filter->input));
     // 筛选条件变更后重置分页，并立即更新显示。
-    if(!filter->playback) receive_offset = 0;
+    receive_offset = 0;
     refresh_filter(filter);
 }
 
@@ -239,7 +205,7 @@ static void filter_clear_cb(lv_event_t *event)
     lv_textarea_set_text(filter->input, "");
     // 带字符限制的输入框，设置空字符串不一定触发 VALUE_CHANGED。
     filter->text[0] = '\0';
-    if(!filter->playback) receive_offset = 0;
+    receive_offset = 0;
     refresh_filter(filter);
 }
 
@@ -334,7 +300,7 @@ void ui_set_archive_callback(ui_archive_callback_t callback)
     archive_callback = callback;
 }
 
-// 页面切换与手动按钮共用归档请求接口，避免界面依赖 FatFs 或 HAL。
+// 仅由手动归档按钮提交请求，页面切换不改变活动文件。
 static void request_archive(void)
 {
     if(archive_callback != NULL) {
@@ -364,16 +330,16 @@ static void show_page(bool show_playback)
             receive_filter.input = receive_filter.table = receive_filter.matches = NULL;
         }
         if(playback_page == NULL) {
+            LogPlayer_RequestRefresh();
             create_playback_page(screen);
-            request_archive();
         }
     }
     else {
         if(playback_page != NULL) {
             lv_obj_delete(playback_page);
             playback_page = NULL;
-            playback_filter.input = playback_filter.table = playback_filter.matches = NULL;
-            archive_notice = archive_name_label = active_log_label = NULL;
+            archive_notice = active_log_label = NULL;
+            LogPlayer_SetActive(0U);
         }
         if(receive_page == NULL) {
             create_receive_page(screen);
@@ -399,8 +365,7 @@ static void tab_event_cb(lv_event_t *event)
 }
 
 /**
- * @brief 更新运行状态及接收异常提示。
- * @note 周期为 100 ms，由主循环中的 lv_timer_handler() 调度，不在中断中执行。
+ * @brief 将 FatFs 错误码映射为名称，供状态栏及历史读取提示共用。
  */
 static const char *fatfs_error_name(uint32_t error)
 {
@@ -415,26 +380,134 @@ static const char *fatfs_error_name(uint32_t error)
     return error < sizeof(names) / sizeof(names[0]) ? names[error] : "FR_UNKNOWN";
 }
 
-// 更新归档结果，历史文件的枚举与报文读取在后续阶段实现。
+// 归档提示与历史文件读取状态分别显示，读取失败不影响活动日志状态。
 static void refresh_archive(const CanStatsRuntime *runtime)
 {
     if(archive_notice == NULL) return;
-    const char *notice;
-    if(archive_callback == NULL) notice = "Simulator: no SD card";
-    else switch(runtime->archive_state) {
-        case CAN_ARCHIVE_PENDING: notice = "Archiving..."; break;
-        case CAN_ARCHIVE_DONE: notice = "Archive complete"; break;
-        case CAN_ARCHIVE_EMPTY: notice = "No frames; archive skipped"; break;
-        case CAN_ARCHIVE_FAILED: notice = "Archive failed; check SD"; break;
-        default: notice = "No archive request"; break;
+    char notice[100];
+    if(archive_callback == NULL) {
+        lv_snprintf(notice, sizeof(notice), "Local CSV viewer; SD archive unavailable");
     }
-    const char *name = runtime->archive_name[0] ? runtime->archive_name : "None this session";
-    const char *active = runtime->sd_state == CAN_LOG_RECORDING ?
-        "CANLOG.CSV\n正在记录，暂不可回放" : "CANLOG.CSV\n记录未就绪";
-    // 仅在文字变化时重新分配标签文本，减少周期刷新产生的动态内存操作。
+    else switch(runtime->archive_state) {
+        case CAN_ARCHIVE_PENDING: lv_snprintf(notice, sizeof(notice), "Archiving..."); break;
+        case CAN_ARCHIVE_DONE:
+            lv_snprintf(notice, sizeof(notice), "Last archive: %s", runtime->archive_name);
+            break;
+        case CAN_ARCHIVE_EMPTY: lv_snprintf(notice, sizeof(notice), "No frames; archive skipped"); break;
+        case CAN_ARCHIVE_FAILED: lv_snprintf(notice, sizeof(notice), "Archive failed; see SD error above"); break;
+        default: lv_snprintf(notice, sizeof(notice), "Manual archive or automatic split at 10 MiB"); break;
+    }
+    const char *active_text = archive_callback == NULL ? "Local files; MCU logging not connected" :
+        runtime->sd_state == CAN_LOG_RECORDING ? "CANLOG.CSV: recording | 10 MiB auto archive" :
+        "CANLOG.CSV: not recording";
     if(strcmp(lv_label_get_text(archive_notice), notice) != 0) lv_label_set_text(archive_notice, notice);
-    if(strcmp(lv_label_get_text(archive_name_label), name) != 0) lv_label_set_text(archive_name_label, name);
-    if(strcmp(lv_label_get_text(active_log_label), active) != 0) lv_label_set_text(active_log_label, active);
+    if(strcmp(lv_label_get_text(active_log_label), active_text) != 0) lv_label_set_text(active_log_label, active_text);
+}
+
+// 按数据版本更新文件列表与预览，文件读取由主循环完成。
+static void refresh_player(void)
+{
+    if(playback_page == NULL) return;
+    const LogPlayerView *view = LogPlayer_GetView();
+    if(player_display_valid && displayed_player_revision == view->revision) return;
+    player_display_valid = true;
+    displayed_player_revision = view->revision;
+    if(view->list_state == LOG_LIST_SCANNING) lv_label_set_text(list_status_label, "Scanning...");
+    else if(view->list_state == LOG_LIST_ERROR) {
+        lv_label_set_text_fmt(list_status_label, "List error: %lu", (unsigned long)view->list_error);
+    }
+    else lv_label_set_text_fmt(list_status_label, "%lu files", (unsigned long)view->total_files);
+
+    for(unsigned i = 0; i < LOG_PLAYER_PAGE_SIZE; i++) {
+        bool visible = view->list_state == LOG_LIST_READY && i < view->file_count;
+        lv_obj_set_hidden(file_buttons[i], !visible);
+        if(!visible) continue;
+        lv_snprintf(file_button_names[i], sizeof(file_button_names[i]), "%s", view->files[i].name);
+        lv_label_set_text(lv_obj_get_child(file_buttons[i], 0), file_button_names[i]);
+        lv_obj_set_style_bg_color(file_buttons[i], lv_color_hex(
+            strcmp(view->selected_name, file_button_names[i]) == 0 ? UI_COLOR_BLUE : UI_COLOR_PANEL),
+            LV_PART_MAIN);
+    }
+    uint32_t pages = (view->total_files + LOG_PLAYER_PAGE_SIZE - 1U) / LOG_PLAYER_PAGE_SIZE;
+    lv_label_set_text_fmt(list_page_label, "%lu / %lu",
+        (unsigned long)(view->file_count ? view->page + 1U : 0U), (unsigned long)pages);
+    lv_obj_set_disabled(list_previous, view->list_state != LOG_LIST_READY || view->page == 0U);
+    lv_obj_set_disabled(list_next, view->list_state != LOG_LIST_READY ||
+        (view->page + 1U) * LOG_PLAYER_PAGE_SIZE >= view->total_files);
+
+    lv_label_set_text(selected_file_label, view->selected_name[0] ? view->selected_name : "Select a history file");
+    lv_label_set_text_fmt(selected_size_label, "%lu B", (unsigned long)view->selected_size);
+    uint32_t color = UI_COLOR_MUTED;
+    switch(view->preview_state) {
+        case LOG_PREVIEW_LOADING: lv_label_set_text(preview_status_label, "Reading first frames..."); break;
+        case LOG_PREVIEW_READY: lv_label_set_text(preview_status_label, "Preview ready"); break;
+        case LOG_PREVIEW_EMPTY: lv_label_set_text(preview_status_label, "Empty log (no frames)"); break;
+        case LOG_PREVIEW_FORMAT_ERROR:
+            lv_label_set_text_fmt(preview_status_label, "CSV format error at line %lu",
+                                 (unsigned long)view->line_number);
+            color = 0xE35B5B;
+            break;
+        case LOG_PREVIEW_IO_ERROR:
+            lv_label_set_text_fmt(preview_status_label, "Read error: %lu (%s)",
+                (unsigned long)view->preview_error, fatfs_error_name(view->preview_error));
+            color = 0xE35B5B;
+            break;
+        default:
+            if(view->list_state == LOG_LIST_ERROR) {
+                lv_label_set_text_fmt(preview_status_label, "List error: %lu (%s)",
+                    (unsigned long)view->list_error, fatfs_error_name(view->list_error));
+                color = 0xE35B5B;
+            }
+            else lv_label_set_text(preview_status_label,
+                view->list_state == LOG_LIST_SCANNING ? "Scanning history directory..." :
+                view->total_files ? "Select a file on the left" : "No history logs");
+            break;
+    }
+    lv_obj_set_style_text_color(preview_status_label, lv_color_hex(color), LV_PART_MAIN);
+    lv_label_set_text_fmt(preview_count_label, "First %u frames (preview only)", (unsigned)view->frame_count);
+    lv_table_set_row_count(preview_table, view->frame_count + 1U);
+    for(unsigned i = 0; i < view->frame_count; i++) {
+        const CanFrame *frame = &view->frames[i];
+        char text[32];
+        lv_snprintf(text, sizeof(text), "%lu.%06lu", (unsigned long)(frame->timestamp_us / 1000000U),
+                    (unsigned long)(frame->timestamp_us % 1000000U));
+        lv_table_set_cell_value(preview_table, i + 1U, 0, text);
+        lv_snprintf(text, sizeof(text), "0x%lX", (unsigned long)frame->id);
+        lv_table_set_cell_value(preview_table, i + 1U, 1, text);
+        lv_snprintf(text, sizeof(text), "%s%s", frame->ide ? "扩展" : "标准", frame->rtr ? " RTR" : "");
+        lv_table_set_cell_value(preview_table, i + 1U, 2, text);
+        lv_snprintf(text, sizeof(text), "%u", (unsigned)frame->dlc);
+        lv_table_set_cell_value(preview_table, i + 1U, 3, text);
+        unsigned used = 0U;
+        text[0] = '\0';
+        if(frame->rtr == 0U) {
+            for(unsigned j = 0; j < frame->dlc; j++) {
+                used += (unsigned)lv_snprintf(text + used, sizeof(text) - used,
+                    j ? " %02X" : "%02X", (unsigned)frame->data[j]);
+            }
+        }
+        lv_table_set_cell_value(preview_table, i + 1U, 4, text);
+    }
+}
+
+static void file_event_cb(lv_event_t *event)
+{
+    // 使用按钮实际显示的文件名，避免目录更新与界面刷新之间选择错误条目。
+    LogPlayer_RequestOpen(lv_event_get_user_data(event));
+    refresh_player();
+}
+
+static void history_page_cb(lv_event_t *event)
+{
+    LogPlayer_RequestPage((int)(intptr_t)lv_event_get_user_data(event));
+    refresh_player();
+}
+
+static void history_refresh_cb(lv_event_t *event)
+{
+    (void)event;
+    LogPlayer_RequestRefresh();
+    refresh_player();
 }
 
 static void refresh_runtime(void)
@@ -493,6 +566,7 @@ static void stats_timer_cb(lv_timer_t *timer)
 {
     (void)timer;
     refresh_runtime();
+    refresh_player();
     uint32_t total = CanStats_GetTotalCount();
     if(total == displayed_total) return;  // 统计未变化时跳过控件更新。
     displayed_total = total;
@@ -590,87 +664,72 @@ static void create_receive_page(lv_obj_t *screen)
     bind_filter(&receive_filter, filter, clear, table, matches);
 }
 
-//建回放页面界面
+// 创建历史文件选择和前五帧预览页面；逐帧导航及播放控制在后续阶段接入。
 static void create_playback_page(lv_obj_t *screen)
 {
-    //创建回放页面主容器并设置位置和尺寸
     playback_page = lv_obj_create(screen);
     lv_obj_set_pos(playback_page, 0, 140);
     lv_obj_set_size(playback_page, 800, 340);
     lv_obj_set_style_bg_opa(playback_page, LV_OPA_TRANSP, LV_PART_MAIN);
     lv_obj_set_style_border_width(playback_page, 0, LV_PART_MAIN);
     lv_obj_set_style_pad_all(playback_page, 0, LV_PART_MAIN);
-    //左侧文件列表面板 - 显示SD卡中的CAN日志文件
-    create_label(playback_page, "SD 日志文件", 16, 4, 180, lv_color_hex(UI_COLOR_MUTED), 0);
-    lv_obj_t *file_panel = lv_obj_create(playback_page);
-    lv_obj_set_pos(file_panel, 8, 32);
-    lv_obj_set_size(file_panel, 190, 300);
-    lv_obj_set_style_bg_color(file_panel, lv_color_hex(UI_COLOR_PANEL), LV_PART_MAIN);
-    lv_obj_set_style_border_color(file_panel, lv_color_hex(UI_COLOR_LINE), LV_PART_MAIN);
-    lv_obj_set_style_pad_all(file_panel, 6, LV_PART_MAIN);
-    lv_obj_set_scroll_dir(file_panel, LV_DIR_VER);
-    create_label(file_panel, "Last archived file:", 8, 8, 158, lv_color_hex(UI_COLOR_MUTED), 0);
-    archive_name_label = create_label(file_panel, "", 8, 38, 158,
-                                      lv_color_hex(UI_COLOR_TEXT), 0);
-    create_label(file_panel, "History list:\nnext stage", 8, 80, 158,
-                 lv_color_hex(UI_COLOR_MUTED), 0);
-    lv_obj_t *archive_button = create_button(file_panel, "Archive log", 4, 132, 168, 36, false);
-    lv_obj_add_event_cb(archive_button, archive_event_cb, LV_EVENT_CLICKED, NULL);
-    archive_notice = create_label(file_panel, "", 8, 180, 158,
-                                  lv_color_hex(UI_COLOR_MUTED), 0);
-    active_log_label = create_label(file_panel, "", 8, 238, 158,
-                 lv_color_hex(UI_COLOR_MUTED), 0);
-    refresh_archive(CanStats_GetRuntime());
+    create_label(playback_page, "SD 日志文件", 16, 0, 180, lv_color_hex(UI_COLOR_MUTED), 0);
 
-    //右侧内容区域 - 文件名和帧统计信息 
-    create_label(playback_page, "Sample data (playback pending)", 216, 4, 340, lv_color_hex(UI_COLOR_TEXT), 0);
-    create_label(playback_page, "-- / --", 660, 4, 125,
-                 lv_color_hex(UI_COLOR_MUTED), 0);
-
-
-    //进度条 - 显示当前回放位置 
-    lv_obj_t *progress = lv_bar_create(playback_page);
-    lv_obj_set_pos(progress, 210, 30);
-    lv_obj_set_size(progress, 578, 8);
-    lv_bar_set_range(progress, 0, 100);
-    lv_bar_set_value(progress, 0, LV_ANIM_OFF);
-
-    //播放控制按钮组
-    create_button(playback_page, "上一帧", 210, 49, 95, 40, false);
-    create_button(playback_page, "播放/暂停", 315, 49, 120, 40, true);
-    create_button(playback_page, "停止", 445, 49, 85, 40, false);
-    create_button(playback_page, "下一帧", 540, 49, 95, 40, false);
-
-    //ID过滤器输入区域
-    create_label(playback_page, "ID (hex)", 210, 105, 70, lv_color_hex(UI_COLOR_MUTED), 0);
-    lv_obj_t *filter = lv_textarea_create(playback_page);
-    lv_obj_set_pos(filter, 282, 96);
-    lv_obj_set_size(filter, 155, 36);
-    lv_textarea_set_one_line(filter, true);
-    lv_textarea_set_placeholder_text(filter, "例如 0x237");
-    lv_obj_set_style_bg_color(filter, lv_color_hex(0x101318), LV_PART_MAIN);
-    lv_obj_set_style_text_color(filter, lv_color_hex(UI_COLOR_TEXT), LV_PART_MAIN);
-    lv_obj_t *clear = create_button(playback_page, "清除", 447, 96, 68, 36, false);
-    lv_obj_t *matches = create_label(playback_page, "", 535, 105, 250,
-                                    lv_color_hex(UI_COLOR_MUTED), 0);
-
-    //CAN数据表格 - 显示回放帧的详细信息
-    lv_obj_t *table = lv_table_create(playback_page);
-    style_data_table(table);
-    lv_obj_set_pos(table, 204, 142);
-    lv_obj_set_size(table, 584, 190);
-    lv_table_set_column_count(table, 5);
-    lv_table_set_row_count(table, 6);
-    lv_table_set_column_width(table, 0, 95);
-    lv_table_set_column_width(table, 1, 125);
-    lv_table_set_column_width(table, 2, 75);
-    lv_table_set_column_width(table, 3, 55);
-    lv_table_set_column_width(table, 4, 230);
-    const char *headers[] = {"时间(s)", "CAN-ID", "类型", "DLC", "Data"};
-    for(uint32_t col = 0; col < 5; col++) {
-        lv_table_set_cell_value(table, 0, col, headers[col]);
+    lv_obj_t *panel = lv_obj_create(playback_page);
+    lv_obj_set_pos(panel, 8, 26);
+    lv_obj_set_size(panel, 190, 306);
+    lv_obj_set_style_bg_color(panel, lv_color_hex(UI_COLOR_PANEL), LV_PART_MAIN);
+    lv_obj_set_style_border_color(panel, lv_color_hex(UI_COLOR_LINE), LV_PART_MAIN);
+    lv_obj_set_style_pad_all(panel, 6, LV_PART_MAIN);
+    lv_obj_set_scroll_dir(panel, LV_DIR_VER);
+    list_status_label = create_label(panel, "", 4, 0, 168, lv_color_hex(UI_COLOR_MUTED), 0);
+    lv_label_set_long_mode(list_status_label, LV_LABEL_LONG_MODE_DOTS);
+    lv_obj_set_height(list_status_label, 18);
+    for(unsigned i = 0; i < LOG_PLAYER_PAGE_SIZE; i++) {
+        file_buttons[i] = create_button(panel, "", 4, 24 + (lv_coord_t)i * 34, 168, 30, false);
+        lv_obj_set_style_pad_hor(file_buttons[i], 4, LV_PART_MAIN);
+        lv_obj_t *label = lv_obj_get_child(file_buttons[i], 0);
+        lv_label_set_long_mode(label, LV_LABEL_LONG_MODE_DOTS);
+        lv_obj_set_width(label, 158);
+        lv_obj_set_style_text_align(label, LV_TEXT_ALIGN_LEFT, LV_PART_MAIN);
+        lv_obj_add_event_cb(file_buttons[i], file_event_cb, LV_EVENT_CLICKED, file_button_names[i]);
     }
-    bind_filter(&playback_filter, filter, clear, table, matches);
+    list_previous = create_button(panel, "<", 4, 165, 36, 28, false);
+    list_next = create_button(panel, ">", 132, 165, 36, 28, false);
+    list_page_label = create_label(panel, "", 48, 171, 80, lv_color_hex(UI_COLOR_MUTED), 0);
+    lv_obj_add_event_cb(list_previous, history_page_cb, LV_EVENT_CLICKED, (void *)(intptr_t)-1);
+    lv_obj_add_event_cb(list_next, history_page_cb, LV_EVENT_CLICKED, (void *)(intptr_t)1);
+    lv_obj_t *refresh = create_button(panel, "Refresh", 4, 201, 168, 32, false);
+    lv_obj_add_event_cb(refresh, history_refresh_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_t *archive = create_button(panel, "Archive log", 4, 243, 168, 34, false);
+    lv_obj_add_event_cb(archive, archive_event_cb, LV_EVENT_CLICKED, NULL);
+
+    selected_file_label = create_label(playback_page, "", 216, 4, 420, lv_color_hex(UI_COLOR_TEXT), 0);
+    selected_size_label = create_label(playback_page, "", 650, 4, 135, lv_color_hex(UI_COLOR_MUTED), 0);
+    preview_status_label = create_label(playback_page, "", 216, 28, 570, lv_color_hex(UI_COLOR_MUTED), 0);
+    archive_notice = create_label(playback_page, "", 216, 52, 570, lv_color_hex(UI_COLOR_MUTED), 0);
+    active_log_label = create_label(playback_page, "", 216, 76, 570, lv_color_hex(UI_COLOR_MUTED), 0);
+    preview_count_label = create_label(playback_page, "", 216, 100, 570, lv_color_hex(UI_COLOR_MUTED), 0);
+    lv_label_set_long_mode(selected_file_label, LV_LABEL_LONG_MODE_DOTS);
+    lv_label_set_long_mode(preview_status_label, LV_LABEL_LONG_MODE_DOTS);
+    lv_label_set_long_mode(archive_notice, LV_LABEL_LONG_MODE_DOTS);
+    lv_label_set_long_mode(active_log_label, LV_LABEL_LONG_MODE_DOTS);
+
+    preview_table = lv_table_create(playback_page);
+    style_data_table(preview_table);
+    lv_obj_set_pos(preview_table, 204, 124);
+    lv_obj_set_size(preview_table, 584, 208);
+    lv_table_set_column_count(preview_table, 5);
+    lv_table_set_row_count(preview_table, 1);
+    const uint16_t widths[] = {90, 120, 100, 45, 225};
+    const char *headers[] = {"时间(s)", "CAN-ID", "类型", "DLC", "Data"};
+    for(unsigned i = 0; i < 5U; i++) {
+        lv_table_set_column_width(preview_table, i, widths[i]);
+        lv_table_set_cell_value(preview_table, 0, i, headers[i]);
+    }
+    player_display_valid = false;
+    refresh_archive(CanStats_GetRuntime());
+    refresh_player();
 }
 
 void ui_init(void)

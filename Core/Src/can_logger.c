@@ -17,6 +17,7 @@ static CanArchiveState archiveState = CAN_ARCHIVE_IDLE;
 static char lastArchiveName[CAN_LOG_ARCHIVE_NAME_SIZE];
 static uint32_t nextArchiveNumber = 1U;
 static uint32_t archiveRequestTick;
+static uint32_t archiveRevision;
 
 static FIL logFile;  //当前打开的日志文件对象
 static uint8_t logReady = 0U;  // 1 表示 SD 卡已挂载并打开日志文件，0 表示不可写
@@ -126,6 +127,7 @@ static FRESULT CanLogger_RenameActive(void)
     if(result == FR_EXIST) continue;
     if(result != FR_OK) return result;
     snprintf(lastArchiveName, sizeof(lastArchiveName), "%s", name);
+    archiveRevision++;
     printf("SD LOG: archived to %s\r\n", target);
     return FR_OK;
   }
@@ -210,6 +212,7 @@ uint8_t CanLogger_Init(void)
   loggedFrameCount = 0U;
   firstWriteSyncReported = 0U;
   archiveState = CAN_ARCHIVE_IDLE;
+  archiveRevision = 0U;
   lastArchiveName[0] = '\0';
   if(retSD != 0U) {
     lastError = FR_NOT_ENABLED;
@@ -330,6 +333,12 @@ void CanLogger_AddFrame(const CanFrame *frame)
   row[used++] = '\r';
   row[used++] = '\n';
 
+  // 在完整报文边界切分，文件大小计算包含尚未写出的 RAM 缓冲。
+  if(logHasFrames && (uint32_t)f_size(&logFile) + logBufferLength + (UINT)used > CAN_LOG_MAX_FILE_SIZE) {
+    CanLogger_ArchiveCurrent();
+    if(logReady == 0U) return;
+  }
+
   // 若当前行长度超过缓冲区大小，先写完已有内容，再放入新行。
   if ((UINT)used > (CAN_LOG_BUFFER_SIZE - logBufferLength)) 
   {
@@ -349,6 +358,10 @@ void CanLogger_AddFrame(const CanFrame *frame)
 void CanLogger_Process(void)
 {
   FRESULT result;  
+
+  if(logReady && logHasFrames && (uint32_t)f_size(&logFile) + logBufferLength >= CAN_LOG_MAX_FILE_SIZE) {
+    CanLogger_ArchiveCurrent();
+  }
 
   // 请求由界面提交，实际文件操作仅在主循环执行。
   // 预留一个界面绘制周期，使请求提示先于同步文件操作显示；期间仍正常记录。
@@ -407,3 +420,4 @@ CanLoggerState CanLogger_GetState(void) { return logState; }
 uint32_t CanLogger_GetLastError(void) { return (uint32_t)lastError; }
 CanArchiveState CanLogger_GetArchiveState(void) { return archiveState; }
 const char *CanLogger_GetLastArchiveName(void) { return lastArchiveName; }
+uint32_t CanLogger_GetArchiveRevision(void) { return archiveRevision; }

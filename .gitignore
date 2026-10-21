@@ -7,3 +7,5 @@ mx.scratch
 !.settings
 # VS Code 本地配置（含本机绝对路径，不提交）
 .vscode/
+simulator/logs/*
+!simulator/logs/.gitkeep

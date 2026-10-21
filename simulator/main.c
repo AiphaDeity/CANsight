@@ -5,6 +5,7 @@
 #include "lvgl/drivers/windows/lv_windows_input.h"
 #include "ui.h"
 #include "can_stats.h"
+#include "log_player.h"
 
 /**
  * @brief 生成本机模拟报文并更新共用统计模块。
@@ -37,7 +38,7 @@ static void simulate_can_cb(lv_timer_t *timer)
     }
 }
 
-int main(void)
+int main(int argc, char **argv)
 {
     lv_init();
 
@@ -68,16 +69,19 @@ int main(void)
         .sd_state = CAN_LOG_RECORDING
     };
     CanStats_SetRuntime(&runtime);
+    LogPlayer_Init(argc > 1 ? argv[1] : "simulator/logs");
     ui_init();
     lv_timer_create(simulate_can_cb, 10, NULL);  // 注册 10 ms 周期的模拟报文调度任务。
 
     // 持续运行 LVGL 定时器
     while(1) {
         uint32_t wait_ms = lv_timer_handler();
+        LogPlayer_Process();
 
         if(wait_ms == LV_NO_TIMER_READY) {
             wait_ms = LV_DEF_REFR_PERIOD;
         }
+        if(LogPlayer_IsBusy() && wait_ms > 5U) wait_ms = 5U;
 
         lv_sleep_ms(wait_ms);
     }

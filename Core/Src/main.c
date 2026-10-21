@@ -33,6 +33,7 @@
 #include "stdio.h"
 #include "can_logger.h"
 #include "can_stats.h"
+#include "log_player.h"
 #include "lv_port_disp.h"
 #include "lv_port_indev.h"
 #include "gt911.h"
@@ -259,6 +260,7 @@ int main(void)
   {
     printf("SD LOG: disabled; CAN reception will continue\r\n");
   }
+  LogPlayer_Init(SDPath);
 
 
   // CAN1过滤器配置，ID和Mask都设为0，表示接收所有符合格式的报文。
@@ -353,6 +355,7 @@ int main(void)
 
     // 定期把缓冲记录同步到卡；不在 CAN 中断里调用 FatFs。
     CanLogger_Process();
+    LogPlayer_Process();  // 日志写入优先，历史读取每轮仅执行一个有界批次。
   }
   /* USER CODE END 3 */
 }

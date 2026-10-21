@@ -36,6 +36,7 @@ target_compile_definitions(lvgl PUBLIC
 add_executable(cansight_sim
     main.c
     ../Core/Src/can_stats.c
+    ../Core/Src/log_player.c
     ../GUI/App/ui.c
     ../GUI/App/lv_font_cansight_14.c
 )
@@ -43,6 +44,7 @@ target_include_directories(cansight_sim PRIVATE
     ../GUI/App
     ../Core/Inc
 )
+target_compile_definitions(cansight_sim PRIVATE CAN_PLAYER_SIMULATOR=1)
 
 # 链接库
 target_link_libraries(cansight_sim PRIVATE

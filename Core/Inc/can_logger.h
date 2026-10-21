@@ -23,6 +23,7 @@ typedef enum {
 } CanLoggerState;
 
 #define CAN_LOG_ARCHIVE_NAME_SIZE 24U
+#define CAN_LOG_MAX_FILE_SIZE (10UL * 1024UL * 1024UL)  // 单个活动日志的大小上限。
 
 // 归档请求的处理状态，与日志写入状态分别维护。
 typedef enum {
@@ -42,6 +43,8 @@ uint8_t CanLogger_RequestArchive(void);
 CanArchiveState CanLogger_GetArchiveState(void);
 // 返回最近成功归档的文件名，只读，无归档记录时为空字符串。
 const char *CanLogger_GetLastArchiveName(void);
+// 每次成功生成历史文件后递增，供文件列表判断是否需要刷新。
+uint32_t CanLogger_GetArchiveRevision(void);
 
 // 获取日志状态及最近一次 FatFs 错误码，仅读取模块状态。
 CanLoggerState CanLogger_GetState(void);
