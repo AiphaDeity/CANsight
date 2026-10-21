@@ -1,5 +1,6 @@
 #include "can_logger.h"
 #include "can_time.h"
+#include "can_timestamp.h"
 
 #include "fatfs.h"
 #include "main.h"
@@ -29,7 +30,8 @@ static uint8_t logErrorReported = 0U;  // 错误只报告一次，避免刷屏
 static char logBuffer[CAN_LOG_BUFFER_SIZE];  // RAM 缓冲区，存放 CSV 文本
 static UINT logBufferLength = 0U;  // RAM 缓冲区中已使用的字节数
 static uint32_t lastSyncTick = 0U;  // 上次同步文件的 HAL_GetTick() 时间戳
-static uint32_t loggedFrameCount = 0U;  // 累计写入日志的报文帧数
+static uint32_t loggedFrameCount = 0U;  // 当前活动文件已接纳的帧数，包含 RAM 缓冲。
+static CanLoggerDiagnostics diagnostics;  // 跨归档保留本次初始化以来的累计诊断。
 static uint8_t logHasFrames;  // 独立记录非空状态，避免累计计数回绕后误判为空。
 static uint8_t firstWriteSyncReported = 0U;  // 首批报文完成写入并同步后提示一次，便于不拔卡确认日志工作
 
@@ -45,8 +47,42 @@ static void CanLogger_StopWithError(const char *stage, FRESULT result)
   {
     printf("SD LOG: error at %s, FatFs result=%d\r\n",
            stage, (int)result);
-    logErrorReported = 1U;  //标记已报告
+    // 只在日志首次停止时输出底层首故障，不在扇区读写或接收中断内打印。
+    const SdDiskFault *fault = SD_GetFirstFault();
+    if(fault->valid != 0U) {
+      printf("SD IO first fault: op=%s sector=%lu blocks=%lu result=%lu elapsed_ms=%lu\r\n",
+             fault->operation, (unsigned long)fault->sector,
+             (unsigned long)fault->blocks, (unsigned long)fault->disk_result,
+             (unsigned long)fault->elapsed_ms);
+      printf("SD IO: HAL=0x%08lX state=%lu STA=0x%08lX\r\n",
+             (unsigned long)fault->hal_error, (unsigned long)fault->hal_state,
+             (unsigned long)fault->sdio_status);
+      printf("SD IO: TX_UNDERRUN=%u RX_OVERRUN=%u DATA_CRC_FAIL=%u DATA_TIMEOUT=%u CMD_TIMEOUT=%u\r\n",
+             (unsigned)((fault->hal_error & HAL_SD_ERROR_TX_UNDERRUN) != 0U),
+             (unsigned)((fault->hal_error & HAL_SD_ERROR_RX_OVERRUN) != 0U),
+             (unsigned)((fault->hal_error & HAL_SD_ERROR_DATA_CRC_FAIL) != 0U),
+             (unsigned)((fault->hal_error & HAL_SD_ERROR_DATA_TIMEOUT) != 0U),
+             (unsigned)((fault->hal_error & HAL_SD_ERROR_CMD_RSP_TIMEOUT) != 0U));
+    }
+    logErrorReported = 1U;  // 首故障不会被后续历史读取或容量查询错误替代。
   }
+}
+
+// 对最长调用耗时保留峰值；低 32 位微秒差值适用于有界的单次文件操作。
+static void CanLogger_RecordDuration(uint32_t *maximum, uint32_t started)
+{
+  uint32_t elapsed = (uint32_t)CanTimestamp_GetUs() - started;
+  if(elapsed > *maximum) *maximum = elapsed;
+}
+
+// 同步成功仅表示 FatFs 及底层驱动已完成同步，不保证故障卡的物理持久性。
+static FRESULT CanLogger_SyncFile(void)
+{
+  uint32_t started = (uint32_t)CanTimestamp_GetUs();
+  FRESULT result = f_sync(&logFile);
+  CanLogger_RecordDuration(&diagnostics.max_sync_us, started);
+  if(result == FR_OK) diagnostics.synced_frames = diagnostics.written_frames;
+  return result;
 }
 
 // 把 RAM 中积累的 CSV 内容写入当前文件。
@@ -60,14 +96,18 @@ static uint8_t CanLogger_FlushBuffer(void)
     return 1U;  //返回成功
   }
 
-  result = f_write(&logFile, logBuffer, logBufferLength, &bytesWritten);  //写入文件
+  uint32_t started = (uint32_t)CanTimestamp_GetUs();
+  result = f_write(&logFile, logBuffer, logBufferLength, &bytesWritten);
+  CanLogger_RecordDuration(&diagnostics.max_write_us, started);
   if ((result != FR_OK) || (bytesWritten != logBufferLength))  //写入失败或写入字节数不符
   {
     CanLogger_StopWithError("write", result == FR_OK ? FR_DISK_ERR : result);
     return 0U;
   }
 
-  logBufferLength = 0U;  //清空缓冲区
+  diagnostics.written_frames += diagnostics.buffered_frames;
+  diagnostics.buffered_frames = 0U;
+  logBufferLength = 0U;  // 完整缓冲写入成功后才释放，部分写入不计入完成帧数。
   return 1U;
 }
 
@@ -189,7 +229,7 @@ static uint8_t CanLogger_OpenActive(void)
   else {
     result = FR_EXIST;
   }
-  if(result == FR_OK) result = f_sync(&logFile);
+  if(result == FR_OK) result = CanLogger_SyncFile();
   if(result != FR_OK) {
     CanLogger_StopWithError("prepare active", result);
     (void)f_close(&logFile);
@@ -209,6 +249,7 @@ static uint8_t CanLogger_OpenActive(void)
 // 归档上次采集的非空活动日志，成功后建立本次采集的活动文件。
 uint8_t CanLogger_Init(void)
 {
+  memset(&diagnostics, 0, sizeof(diagnostics));
   logReady = 0U;
   logState = CAN_LOG_UNMOUNTED;
   lastError = FR_OK;
@@ -246,7 +287,7 @@ uint8_t CanLogger_Init(void)
 }
 
 // 先持久化并关闭当前文件，再归档和建立新文件；失败时停止日志并保留原数据。
-static void CanLogger_ArchiveCurrent(void)
+static void CanLogger_ArchiveCurrentInternal(void)
 {
   if(logHasFrames == 0U) {
     archiveState = CAN_ARCHIVE_EMPTY;
@@ -257,7 +298,7 @@ static void CanLogger_ArchiveCurrent(void)
     archiveState = CAN_ARCHIVE_FAILED;
     return;
   }
-  FRESULT result = f_sync(&logFile);
+  FRESULT result = CanLogger_SyncFile();
   if(result == FR_OK) result = f_close(&logFile);
   if(result != FR_OK) {
     CanLogger_StopWithError("archive close", result);
@@ -273,6 +314,14 @@ static void CanLogger_ArchiveCurrent(void)
     return;
   }
   archiveState = CanLogger_OpenActive() ? CAN_ARCHIVE_DONE : CAN_ARCHIVE_FAILED;
+}
+
+// 归档耗时包含刷出缓冲、同步、关闭、重命名、新建及状态输出。
+static void CanLogger_ArchiveCurrent(void)
+{
+  uint32_t started = (uint32_t)CanTimestamp_GetUs();
+  CanLogger_ArchiveCurrentInternal();
+  CanLogger_RecordDuration(&diagnostics.max_archive_us, started);
 }
 
 uint8_t CanLogger_RequestArchive(void)
@@ -294,8 +343,9 @@ void CanLogger_AddFrame(const CanFrame *frame)
   int rowLength;  //格式化后的行长度
   int used;  //已使用的缓冲区字节数
 
-  if ((logReady == 0U) || (frame == NULL))  //如果日志不可写或帧指针为空，则直接返回
-  {
+  if(frame == NULL) return;  // 空指针不代表收到一帧，不计入拒收统计。
+  if(logReady == 0U) {
+    diagnostics.rejected_frames++;
     return;
   }
 
@@ -309,6 +359,7 @@ void CanLogger_AddFrame(const CanFrame *frame)
                       (unsigned int)frame->dlc);
   if ((rowLength < 0) || (rowLength >= (int)sizeof(row)))  //格式化失败或行长度超过缓冲区大小
   {
+    diagnostics.rejected_frames++;
     CanLogger_StopWithError("format record", FR_INT_ERR);
     return;
   }
@@ -324,6 +375,7 @@ void CanLogger_AddFrame(const CanFrame *frame)
                              (unsigned int)frame->data[i]);
       if ((written < 0) || (written >= (int)(sizeof(row) - (size_t)used)))  //格式化失败或写入字节数不符
       {
+        diagnostics.rejected_frames++;
         CanLogger_StopWithError("format data", FR_INT_ERR);  //停止写入并报告错误
         return;
       }
@@ -334,6 +386,7 @@ void CanLogger_AddFrame(const CanFrame *frame)
   
   if ((used + 2) >= (int)sizeof(row))  //行结尾格式化失败或行长度超过缓冲区大小
   {
+    diagnostics.rejected_frames++;
     CanLogger_StopWithError("format line ending", FR_INT_ERR);
     return;
   }
@@ -343,7 +396,10 @@ void CanLogger_AddFrame(const CanFrame *frame)
   // 在完整报文边界切分，文件大小计算包含尚未写出的 RAM 缓冲。
   if(logHasFrames && (uint32_t)f_size(&logFile) + logBufferLength + (UINT)used > CAN_LOG_MAX_FILE_SIZE) {
     CanLogger_ArchiveCurrent();
-    if(logReady == 0U) return;
+    if(logReady == 0U) {
+      diagnostics.rejected_frames++;
+      return;
+    }
   }
 
   // 若当前行长度超过缓冲区大小，先写完已有内容，再放入新行。
@@ -351,13 +407,16 @@ void CanLogger_AddFrame(const CanFrame *frame)
   {
     if (CanLogger_FlushBuffer() == 0U)  //缓冲区写满时立即写卡
     {
+      diagnostics.rejected_frames++;
       return;
     }
   }
 
   memcpy(&logBuffer[logBufferLength], row, (size_t)used);  //将行放入缓冲区
   logBufferLength += (UINT)used;  //记录已使用的缓冲区字节数
-  loggedFrameCount++;  //记录已写入的帧数
+  loggedFrameCount++;  // 当前活动文件接纳数，不表示已经完成同步。
+  diagnostics.accepted_frames++;
+  diagnostics.buffered_frames++;
   logHasFrames = 1U;
 }
 
@@ -398,7 +457,7 @@ void CanLogger_Process(void)
       return;
     }
 
-    result = f_sync(&logFile);  //同步文件
+    result = CanLogger_SyncFile();  //同步文件
     if (result != FR_OK)  //同步失败
     {
       CanLogger_StopWithError("sync", result);  //停止写入并报告错误
@@ -428,3 +487,9 @@ uint32_t CanLogger_GetLastError(void) { return (uint32_t)lastError; }
 CanArchiveState CanLogger_GetArchiveState(void) { return archiveState; }
 const char *CanLogger_GetLastArchiveName(void) { return lastArchiveName; }
 uint32_t CanLogger_GetArchiveRevision(void) { return archiveRevision; }
+
+// 返回按值复制的诊断快照；归档不会重置本次运行的峰值及累计帧数。
+void CanLogger_GetDiagnostics(CanLoggerDiagnostics *snapshot)
+{
+  if(snapshot != NULL) *snapshot = diagnostics;
+}

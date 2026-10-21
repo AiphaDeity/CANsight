@@ -14,6 +14,22 @@ typedef struct
   uint8_t data[8];       // 数据帧内容；远程帧没有有效数据。
 } CanFrame;
 
+// 本次初始化以来的日志诊断；归档及新建活动文件不清零累计计数。
+// 帧计数按 uint32_t 自然回绕，耗时以微秒记录，仅读取主循环状态。
+typedef struct {
+  uint32_t accepted_frames;       // 已完整复制至 RAM 日志缓冲的帧数。
+  uint32_t rejected_frames;       // 因日志不可用或本次追加失败而未接纳的帧数。
+  uint32_t written_frames;        // 完整缓冲区经 f_write 成功写出的帧数。
+  uint32_t synced_frames;         // 最近一次成功 f_sync 时已写出的累计帧数。
+  uint32_t buffered_frames;       // 当前 RAM 缓冲中的帧数；写入失败后仍保留。
+  uint32_t max_write_us;          // 数据缓冲 f_write 的最长调用耗时，含失败。
+  uint32_t max_sync_us;           // f_sync 的最长调用耗时，含初始化及失败。
+  uint32_t max_archive_us;        // 单次运行期间归档的最长耗时，含新建及失败。
+} CanLoggerDiagnostics;
+
+// 获取诊断快照，仅供主循环及其界面回调调用，不支持中断并发访问。
+void CanLogger_GetDiagnostics(CanLoggerDiagnostics *diagnostics);
+
 // SD 日志模块的当前状态，不等同于物理插卡检测结果。
 typedef enum {
   CAN_LOG_UNMOUNTED = 0,  // 文件系统尚未成功挂载。

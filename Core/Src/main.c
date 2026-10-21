@@ -48,10 +48,20 @@
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
-// 队列大小
-#define CAN_RX_QUEUE_SIZE 64U
-// 单次主循环的接收处理上限，防止持续来帧阻塞界面任务。
-#define CAN_RX_BATCH_SIZE 32U
+// 保留一个槽位区分空与满，实际可用容量为 511 帧。
+#define CAN_RX_QUEUE_SIZE 512U
+// 每批同时限制帧数与处理时间，避免持续来帧独占主循环。
+#define CAN_RX_BATCH_SIZE 256U
+#define CAN_RX_BATCH_BUDGET_US 2000U
+#define CAN_UI_INTERVAL_MS 5U
+#define CAN_HISTORY_INTERVAL_MS 5U
+#define CAN_HISTORY_QUEUE_LIMIT 128U
+#if (CAN_RX_QUEUE_SIZE < 2U) || ((CAN_RX_QUEUE_SIZE & (CAN_RX_QUEUE_SIZE - 1U)) != 0U)
+#error "CAN_RX_QUEUE_SIZE must be a power of two and at least two"
+#endif
+#if CAN_RX_QUEUE_SIZE > 65536U
+#error "CAN RX queue indices require a wider type"
+#endif
 #ifndef CAN_RX_DEBUG_PRINT
 // 逐帧串口诊断输出开关：1 为启用，0 为禁用；默认禁用以降低阻塞开销。
 #define CAN_RX_DEBUG_PRINT 0
@@ -73,8 +83,8 @@
 static CanFrame canRxQueue[CAN_RX_QUEUE_SIZE];
 
 // head 是中断的写入位置；tail 是主循环的读取位置
-static volatile uint8_t canRxQueueHead = 0U;
-static volatile uint8_t canRxQueueTail = 0U;
+static volatile uint16_t canRxQueueHead = 0U;
+static volatile uint16_t canRxQueueTail = 0U;
 
 // 软件队列满时，无法入队的报文数量
 static volatile uint32_t canRxQueueOverflow = 0U;
@@ -88,6 +98,11 @@ static volatile uint32_t canRxFifo0OverrunEvents = 0U;
 //HAL 报告过的 CAN 错误位集合，便于调试时查看
 static volatile uint32_t canHalErrorFlags = 0U;
 static uint8_t canStartupFailed = 0U;  // 初始化、过滤器配置或启动失败标志。
+static volatile uint32_t canRxQueuePeak;  // 由生产者更新，避免读改写竞争。
+static uint32_t canMaxServiceGapUs;
+static uint32_t canMaxBatchUs;
+static uint32_t canMaxUiUs;
+static uint32_t canMaxHistoryUs;
 
 /* USER CODE END PV */
 
@@ -128,6 +143,15 @@ static void CAN_PublishRuntime(void)
   runtime.error_flags = canHalErrorFlags | HAL_CAN_GetError(&hcan1);
   runtime.sd_state = CanLogger_GetState();
   runtime.sd_error = CanLogger_GetLastError();
+  runtime.fifo_frames = canRxFramesReadFromFifo;
+  runtime.queue_depth = ((uint32_t)canRxQueueHead - canRxQueueTail) & CAN_RX_QUEUE_MASK;
+  runtime.queue_peak = canRxQueuePeak;
+  runtime.queue_capacity = CAN_RX_QUEUE_SIZE - 1U;
+  runtime.max_service_gap_us = canMaxServiceGapUs;
+  runtime.max_batch_us = canMaxBatchUs;
+  runtime.max_ui_us = canMaxUiUs;
+  runtime.max_history_us = canMaxHistoryUs;
+  CanLogger_GetDiagnostics(&runtime.logger);
   runtime.archive_state = CanLogger_GetArchiveState();
   snprintf(runtime.archive_name, sizeof(runtime.archive_name), "%s",
            CanLogger_GetLastArchiveName());
@@ -164,7 +188,9 @@ static uint8_t CAN_RxQueue_PushFromISR(const CanFrame *frame) {
   // 确保帧内容先写完，再发布新的 head 索引，防止主循环读取到不完整的帧
   __DMB(); // 数据同步屏障，确保内存访问顺序
 
-  canRxQueueHead = nextHead; // 更新 head 索引，表示新帧已入队
+  canRxQueueHead = (uint16_t)nextHead; // 发布完整报文后更新生产者位置。
+  uint32_t depth = (nextHead - canRxQueueTail) & CAN_RX_QUEUE_MASK;
+  if(depth > canRxQueuePeak) canRxQueuePeak = depth;
 
   return 1U;
 }
@@ -191,7 +217,7 @@ static uint8_t CAN_RxQueue_Pop(CanFrame *frame) {
   // 复制完成后，移动 tail，释放这个槽位给生产者
   __DMB(); // 数据同步屏障，确保内存访问顺序
 
-  canRxQueueTail = (tail + 1U) & CAN_RX_QUEUE_MASK; // 更新 tail 索引
+  canRxQueueTail = (uint16_t)((tail + 1U) & CAN_RX_QUEUE_MASK); // 更新 tail 索引
 
   return 1U; // 出队成功
 }
@@ -306,6 +332,11 @@ int main(void)
 
   CAN_PublishRuntime();
 
+  // 运行阶段的耗时统计从 CAN 启动后开始，排除硬件及文件系统初始化。
+  uint32_t lastServiceUs = (uint32_t)CanTimestamp_GetUs();
+  uint32_t lastUiTick = HAL_GetTick() - CAN_UI_INTERVAL_MS;
+  uint32_t lastHistoryTick = HAL_GetTick() - CAN_HISTORY_INTERVAL_MS;
+
   /* USER CODE END 2 */
 
   /* Infinite loop */
@@ -315,13 +346,11 @@ int main(void)
 
     /* USER CODE BEGIN 3 */
 
-    // 每轮更新状态快照，确保未接收新报文时，状态和异常提示仍可刷新。
-    CAN_PublishRuntime();
-    // 处理界面刷新、触摸输入和 LVGL 定时任务
-    lv_timer_handler();
-    // 给LVGL留出运行间隔；5ms是初始值
-    HAL_Delay(5);
-
+    // 优先消费接收队列；时间预算只在完整报文之间检查，不中断文件操作。
+    uint32_t batchStarted = (uint32_t)CanTimestamp_GetUs();
+    uint32_t serviceGap = batchStarted - lastServiceUs;
+    lastServiceUs = batchStarted;
+    if(serviceGap > canMaxServiceGapUs) canMaxServiceGapUs = serviceGap;
     CanFrame frame;
 
     // 队列为空或达到处理上限后结束本批次，剩余报文留待下一轮处理。
@@ -352,11 +381,37 @@ int main(void)
 
       printf("\r\n");
 #endif
+      if((uint32_t)CanTimestamp_GetUs() - batchStarted >= CAN_RX_BATCH_BUDGET_US) break;
     }
+    uint32_t elapsed = (uint32_t)CanTimestamp_GetUs() - batchStarted;
+    if(elapsed > canMaxBatchUs) canMaxBatchUs = elapsed;
 
     // 定期把缓冲记录同步到卡；不在 CAN 中断里调用 FatFs。
     CanLogger_Process();
-    LogPlayer_Process();  // 日志写入优先，历史读取每轮仅执行一个有界批次。
+
+    // 界面按时间调度，持续来帧时仍保留输入及状态刷新的执行机会。
+    if(HAL_GetTick() - lastUiTick >= CAN_UI_INTERVAL_MS) {
+      CAN_PublishRuntime();
+      uint32_t started = (uint32_t)CanTimestamp_GetUs();
+      lv_timer_handler();
+      elapsed = (uint32_t)CanTimestamp_GetUs() - started;
+      if(elapsed > canMaxUiUs) canMaxUiUs = elapsed;
+      lastUiTick = HAL_GetTick();
+    }
+
+    // 接收积压较多时延后历史访问；单次同步文件操作仍需由耗时统计评估。
+    uint32_t queued = ((uint32_t)canRxQueueHead - canRxQueueTail) & CAN_RX_QUEUE_MASK;
+    if(queued <= CAN_HISTORY_QUEUE_LIMIT &&
+       HAL_GetTick() - lastHistoryTick >= CAN_HISTORY_INTERVAL_MS) {
+      uint32_t started = (uint32_t)CanTimestamp_GetUs();
+      LogPlayer_Process();
+      elapsed = (uint32_t)CanTimestamp_GetUs() - started;
+      if(elapsed > canMaxHistoryUs) canMaxHistoryUs = elapsed;
+      lastHistoryTick = HAL_GetTick();
+    }
+
+    // 仅在没有接收积压时短暂让出 CPU；有积压立即进入下一批处理。
+    if(canRxQueueHead == canRxQueueTail) HAL_Delay(1);
   }
   /* USER CODE END 3 */
 }

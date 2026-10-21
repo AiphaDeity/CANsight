@@ -17,28 +17,22 @@
   */
 /* USER CODE END Header */
 
-/* Note: code generation based on sd_diskio_template_bspv1.c v2.1.4
-   as "Use dma template" is disabled. */
+// CubeMX 最初生成轮询模板；本文件现以 DMA 完成块传输，并同步等待完成及卡就绪。
 
 /* USER CODE BEGIN firstSection */
-/* can be used to modify / undefine following code or add new definitions */
+// 软件超时单位为毫秒，不使用值为 0xFFFFFFFF 的硬件数据超时常量。
+#define SD_TRANSFER_TIMEOUT_MS 1000U
+#define SD_READY_TIMEOUT_MS 500U
+#define SD_DMA_BLOCKS 8U
 /* USER CODE END firstSection*/
 
 /* Includes ------------------------------------------------------------------*/
 #include "ff_gen_drv.h"
 #include "sd_diskio.h"
+#include <string.h>
 
 /* Private typedef -----------------------------------------------------------*/
 /* Private define ------------------------------------------------------------*/
-/* use the default SD timout as defined in the platform BSP driver*/
-#if defined(SDMMC_DATATIMEOUT)
-#define SD_TIMEOUT SDMMC_DATATIMEOUT
-#elif defined(SD_DATATIMEOUT)
-#define SD_TIMEOUT SD_DATATIMEOUT
-#else
-#define SD_TIMEOUT 30 * 1000
-#endif
-
 #define SD_DEFAULT_BLOCK_SIZE 512
 
 /*
@@ -82,7 +76,105 @@ const Diskio_drvTypeDef  SD_Driver =
 };
 
 /* USER CODE BEGIN beforeFunctionSection */
-/* can be used to modify / undefine following code or add new code */
+extern SD_HandleTypeDef hsd;
+static SdDiskFault firstFault;
+// DMA 不能访问 CCM；本缓冲位于默认普通 SRAM 的 .bss，按 INC4 突发要求对齐。
+// 所有 FatFs 缓冲均经此处中转，避免未对齐、只读或非 DMA 可访问地址直接传输。
+static uint32_t dmaBuffer[SD_DMA_BLOCKS * SD_DEFAULT_BLOCK_SIZE / sizeof(uint32_t)]
+    __attribute__((aligned(16)));
+static volatile uint8_t dmaActive;
+static volatile uint8_t dmaReadDone;
+static volatile uint8_t dmaWriteDone;
+static volatile uint8_t dmaFailed;
+
+// 中断回调仅发布结果，不执行 FatFs、串口输出或接收队列消费。
+void BSP_SD_ReadCpltCallback(void) { if(dmaActive) dmaReadDone = 1U; }
+void BSP_SD_WriteCpltCallback(void) { if(dmaActive) dmaWriteDone = 1U; }
+void BSP_SD_AbortCallback(void) { if(dmaActive) dmaFailed = 1U; }
+void HAL_SD_ErrorCallback(SD_HandleTypeDef *handle)
+{
+  if(handle == &hsd && dmaActive) dmaFailed = 1U;
+}
+
+// 在任何重试或后续卡状态查询之前捕获首个失败现场；本函数不执行串口或卡访问。
+static void SD_RecordFault(const char *operation, DWORD sector, UINT blocks,
+                           DRESULT result, uint32_t started)
+{
+  if(firstFault.valid != 0U) return;
+  firstFault.operation = operation;
+  firstFault.sector = (uint32_t)sector;
+  firstFault.blocks = (uint32_t)blocks;
+  firstFault.disk_result = (uint32_t)result;
+  firstFault.elapsed_ms = HAL_GetTick() - started;
+  firstFault.hal_error = HAL_SD_GetError(&hsd);
+  firstFault.hal_state = (uint32_t)HAL_SD_GetState(&hsd);
+  firstFault.sdio_status = READ_REG(hsd.Instance->STA);
+  firstFault.valid = 1U;
+}
+
+const SdDiskFault *SD_GetFirstFault(void) { return &firstFault; }
+
+// 有界等待卡恢复传输状态；失败后交由 FatFs 向上层报告，不在驱动中重试文件操作。
+static DRESULT SD_WaitReady(const char *operation, DWORD sector, UINT blocks)
+{
+  uint32_t started = HAL_GetTick();
+  while(BSP_SD_GetCardState() != MSD_OK) {
+    if(HAL_GetTick() - started >= SD_READY_TIMEOUT_MS) {
+      SD_RecordFault(operation, sector, blocks, RES_NOTRDY, started);
+      Stat |= STA_NOINIT;
+      return RES_NOTRDY;
+    }
+  }
+  return RES_OK;
+}
+
+// 故障现场由调用方预先捕获；停止 DMA 后才允许复用缓冲，故障锁存至重新初始化。
+static void SD_StopFailedTransfer(void)
+{
+  dmaActive = 0U;
+  (void)HAL_SD_Abort(&hsd);
+  // HAL 出错路径可能已清除 Context，仍须确认两个 DMA 通道均已停止。
+  if(hsd.hdmarx != NULL && HAL_DMA_GetState(hsd.hdmarx) == HAL_DMA_STATE_BUSY) {
+    (void)HAL_DMA_Abort(hsd.hdmarx);
+  }
+  if(hsd.hdmatx != NULL && HAL_DMA_GetState(hsd.hdmatx) == HAL_DMA_STATE_BUSY) {
+    (void)HAL_DMA_Abort(hsd.hdmatx);
+  }
+  CLEAR_BIT(hsd.Instance->DCTRL, SDIO_DCTRL_DMAEN | SDIO_DCTRL_DTEN);
+  Stat |= STA_NOINIT;
+}
+
+// 每次最多传输固定中转缓冲容量；完成回调和卡就绪分别等待，均有超时出口。
+static DRESULT SD_TransferDMA(uint8_t writing, DWORD sector, UINT blocks)
+{
+  const char *operation = writing ? "write-dma" : "read-dma";
+  uint32_t started = HAL_GetTick();
+  dmaReadDone = dmaWriteDone = dmaFailed = 0U;
+  dmaActive = 1U;
+  __DMB();
+  uint8_t status = writing ? BSP_SD_WriteBlocks_DMA(dmaBuffer, sector, blocks) :
+                             BSP_SD_ReadBlocks_DMA(dmaBuffer, sector, blocks);
+  if(status != MSD_OK) {
+    SD_RecordFault(operation, sector, blocks, RES_ERROR, started);
+    SD_StopFailedTransfer();
+    return RES_ERROR;
+  }
+
+  while((writing ? dmaWriteDone : dmaReadDone) == 0U && dmaFailed == 0U) {
+    if(HAL_SD_GetError(&hsd) != HAL_SD_ERROR_NONE ||
+       HAL_GetTick() - started >= SD_TRANSFER_TIMEOUT_MS) {
+      dmaFailed = 1U;
+    }
+  }
+  if(dmaFailed || HAL_SD_GetError(&hsd) != HAL_SD_ERROR_NONE) {
+    SD_RecordFault(operation, sector, blocks, RES_ERROR, started);
+    SD_StopFailedTransfer();
+    return RES_ERROR;
+  }
+  __DMB();  // 完成回调发布后，读取端才可复制 DMA 缓冲中的数据。
+  dmaActive = 0U;
+  return SD_WaitReady(writing ? "write-ready" : "read-ready", sector, blocks);
+}
 /* USER CODE END beforeFunctionSection */
 
 /* Private functions ---------------------------------------------------------*/
@@ -90,6 +182,8 @@ const Diskio_drvTypeDef  SD_Driver =
 static DSTATUS SD_CheckStatus(BYTE lun)
 {
   Stat = STA_NOINIT;
+  // 已发生传输故障时禁止后续历史访问隐式恢复，须经 SD_initialize 重新初始化。
+  if(firstFault.valid != 0U) return Stat;
 
   if(BSP_SD_GetCardState() == MSD_OK)
   {
@@ -106,7 +200,8 @@ static DSTATUS SD_CheckStatus(BYTE lun)
   */
 DSTATUS SD_initialize(BYTE lun)
 {
-Stat = STA_NOINIT;
+  firstFault.valid = 0U;
+  Stat = STA_NOINIT;
 
 #if !defined(DISABLE_SD_INIT)
 
@@ -146,20 +241,19 @@ DSTATUS SD_status(BYTE lun)
 
 DRESULT SD_read(BYTE lun, BYTE *buff, DWORD sector, UINT count)
 {
-  DRESULT res = RES_ERROR;
-
-  if(BSP_SD_ReadBlocks((uint32_t*)buff,
-                       (uint32_t) (sector),
-                       count, SD_TIMEOUT) == MSD_OK)
-  {
-    /* wait until the read operation is finished */
-    while(BSP_SD_GetCardState()!= MSD_OK)
-    {
-    }
-    res = RES_OK;
+  (void)lun;
+  if(buff == NULL || count == 0U) return RES_PARERR;
+  if(Stat & STA_NOINIT) return RES_NOTRDY;
+  while(count != 0U) {
+    UINT blocks = count > SD_DMA_BLOCKS ? SD_DMA_BLOCKS : count;
+    DRESULT result = SD_TransferDMA(0U, sector, blocks);
+    if(result != RES_OK) return result;
+    memcpy(buff, dmaBuffer, blocks * SD_DEFAULT_BLOCK_SIZE);
+    buff += blocks * SD_DEFAULT_BLOCK_SIZE;
+    sector += blocks;
+    count -= blocks;
   }
-
-  return res;
+  return RES_OK;
 }
 
 /* USER CODE BEGIN beforeWriteSection */
@@ -177,20 +271,19 @@ DRESULT SD_read(BYTE lun, BYTE *buff, DWORD sector, UINT count)
 
 DRESULT SD_write(BYTE lun, const BYTE *buff, DWORD sector, UINT count)
 {
-  DRESULT res = RES_ERROR;
-
-  if(BSP_SD_WriteBlocks((uint32_t*)buff,
-                        (uint32_t)(sector),
-                        count, SD_TIMEOUT) == MSD_OK)
-  {
-	/* wait until the Write operation is finished */
-    while(BSP_SD_GetCardState() != MSD_OK)
-    {
-    }
-    res = RES_OK;
+  (void)lun;
+  if(buff == NULL || count == 0U) return RES_PARERR;
+  if(Stat & STA_NOINIT) return RES_NOTRDY;
+  while(count != 0U) {
+    UINT blocks = count > SD_DMA_BLOCKS ? SD_DMA_BLOCKS : count;
+    memcpy(dmaBuffer, buff, blocks * SD_DEFAULT_BLOCK_SIZE);
+    DRESULT result = SD_TransferDMA(1U, sector, blocks);
+    if(result != RES_OK) return result;
+    buff += blocks * SD_DEFAULT_BLOCK_SIZE;
+    sector += blocks;
+    count -= blocks;
   }
-
-  return res;
+  return RES_OK;
 }
 #endif /* _USE_WRITE == 1 */
 
@@ -216,7 +309,7 @@ DRESULT SD_ioctl(BYTE lun, BYTE cmd, void *buff)
   {
   /* Make sure that no pending write process */
   case CTRL_SYNC :
-    res = RES_OK;
+    res = SD_WaitReady("sync-ready", 0U, 0U);
     break;
 
   /* Get number of sectors on the disk (DWORD) */

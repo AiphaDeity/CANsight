@@ -22,6 +22,7 @@ static lv_obj_t *capacity_label;    // 统计表容量不足提示。
 static lv_obj_t *can_status_label;
 static lv_obj_t *sd_status_label;
 static lv_obj_t *diagnostics_label;
+static lv_obj_t *performance_label;
 static ui_archive_callback_t archive_callback;
 static lv_obj_t *archive_notice;
 static lv_obj_t *active_log_label;
@@ -97,6 +98,16 @@ static bool parse_filter(const char *text, uint32_t *id, bool *all)
     return *id <= 0x1FFFFFFFU;
 }
 
+// 内容变化时才更新单元格，避免周期刷新反复分配内存及重算相同文本。
+static void set_table_cell_if_changed(lv_obj_t *table, uint32_t row,
+                                      uint32_t column, const char *text)
+{
+    const char *previous = lv_table_get_cell_value(table, row, column);
+    if(previous == NULL || strcmp(previous, text) != 0) {
+        lv_table_set_cell_value(table, row, column, text);
+    }
+}
+
 // 根据筛选条件和分页偏移刷新接收表格，不修改底层统计。
 static void refresh_receive(ui_filter_t *filter)
 {
@@ -122,13 +133,13 @@ static void refresh_receive(ui_filter_t *filter)
         uint16_t row = i + 1U;
         char text[32];
         lv_snprintf(text, sizeof(text), "0x%lX", (unsigned long)frame->id);
-        lv_table_set_cell_value(filter->table, row, 0, text);
+        set_table_cell_if_changed(filter->table, row, 0, text);
         // 使用 RTR 后缀区分远程帧与数据帧。
         lv_snprintf(text, sizeof(text), "%s%s", frame->ide ? "扩展" : "标准",
                     frame->rtr ? " RTR" : "");
-        lv_table_set_cell_value(filter->table, row, 1, text);
+        set_table_cell_if_changed(filter->table, row, 1, text);
         lv_snprintf(text, sizeof(text), "%u", (unsigned)frame->dlc);
-        lv_table_set_cell_value(filter->table, row, 2, text);
+        set_table_cell_if_changed(filter->table, row, 2, text);
         // 8 字节数据格式化后最多为 23 个字符，不含字符串结束符。
         unsigned used = 0;  // 已写入的字符数。
         text[0] = '\0';
@@ -138,15 +149,15 @@ static void refresh_receive(ui_filter_t *filter)
                     j ? " %02X" : "%02X", (unsigned)frame->data[j]);
             }
         }
-        lv_table_set_cell_value(filter->table, row, 3, text);
+        set_table_cell_if_changed(filter->table, row, 3, text);
         // 使用整数运算将微秒转换为毫秒，并保留三位小数。
         if(entry->has_period) {
             CanTime_FormatFixed(text, entry->period_us, 1000U, 3U);
         }
         else lv_snprintf(text, sizeof(text), "--");
-        lv_table_set_cell_value(filter->table, row, 4, text);
+        set_table_cell_if_changed(filter->table, row, 4, text);
         lv_snprintf(text, sizeof(text), "%lu", (unsigned long)entry->count);
-        lv_table_set_cell_value(filter->table, row, 5, text);
+        set_table_cell_if_changed(filter->table, row, 5, text);
     }
     // 更新匹配条目数、当前显示范围及筛选输入状态。
     if(!valid) lv_label_set_text(filter->matches, "ID 格式错误");
@@ -580,13 +591,13 @@ static void refresh_player(void)
         const CanFrame *frame = &view->frames[i];
         char text[32];
         CanTime_FormatFixed(text, frame->timestamp_us, 1000000U, 6U);
-        lv_table_set_cell_value(preview_table, i + 1U, 0, text);
+        set_table_cell_if_changed(preview_table, i + 1U, 0, text);
         lv_snprintf(text, sizeof(text), "0x%lX", (unsigned long)frame->id);
-        lv_table_set_cell_value(preview_table, i + 1U, 1, text);
+        set_table_cell_if_changed(preview_table, i + 1U, 1, text);
         lv_snprintf(text, sizeof(text), "%s%s", frame->ide ? "扩展" : "标准", frame->rtr ? " RTR" : "");
-        lv_table_set_cell_value(preview_table, i + 1U, 2, text);
+        set_table_cell_if_changed(preview_table, i + 1U, 2, text);
         lv_snprintf(text, sizeof(text), "%u", (unsigned)frame->dlc);
-        lv_table_set_cell_value(preview_table, i + 1U, 3, text);
+        set_table_cell_if_changed(preview_table, i + 1U, 3, text);
         unsigned used = 0U;
         text[0] = '\0';
         if(frame->rtr == 0U) {
@@ -595,7 +606,7 @@ static void refresh_player(void)
                     j ? " %02X" : "%02X", (unsigned)frame->data[j]);
             }
         }
-        lv_table_set_cell_value(preview_table, i + 1U, 4, text);
+        set_table_cell_if_changed(preview_table, i + 1U, 4, text);
     }
 }
 
@@ -734,6 +745,29 @@ static void refresh_runtime(void)
             runtime->queue_lost || runtime->fifo_overruns || runtime->error_flags ||
             runtime->sd_error ? 0xE3B34E : UI_COLOR_MUTED), LV_PART_MAIN);
     }
+    // 仅在累计诊断变化时更新控件；使用 ASCII，避免引入额外字体字符。
+    if(!runtime_display_valid || runtime->queue_peak != displayed_runtime.queue_peak ||
+       runtime->queue_capacity != displayed_runtime.queue_capacity ||
+       runtime->logger.rejected_frames != displayed_runtime.logger.rejected_frames ||
+       runtime->logger.max_write_us != displayed_runtime.logger.max_write_us ||
+       runtime->logger.max_sync_us != displayed_runtime.logger.max_sync_us ||
+       runtime->logger.max_archive_us != displayed_runtime.logger.max_archive_us) {
+        // 模拟器没有硬件接收队列，不显示未采集的硬件性能数据。
+        lv_obj_set_hidden(performance_label, runtime->queue_capacity == 0U);
+        // 显示值向上取整至毫秒，底层快照保留微秒精度。
+        uint32_t write_us = runtime->logger.max_write_us;
+        uint32_t sync_us = runtime->logger.max_sync_us;
+        uint32_t archive_us = runtime->logger.max_archive_us;
+        lv_label_set_text_fmt(performance_label,
+            "Q peak %lu/%lu | Log skip %lu\nSD max ms: W %lu S %lu A %lu",
+            (unsigned long)runtime->queue_peak, (unsigned long)runtime->queue_capacity,
+            (unsigned long)runtime->logger.rejected_frames,
+            (unsigned long)(write_us / 1000U + (write_us % 1000U != 0U)),
+            (unsigned long)(sync_us / 1000U + (sync_us % 1000U != 0U)),
+            (unsigned long)(archive_us / 1000U + (archive_us % 1000U != 0U)));
+        lv_obj_set_style_text_color(performance_label, lv_color_hex(
+            runtime->logger.rejected_frames ? 0xE3B34E : UI_COLOR_MUTED), LV_PART_MAIN);
+    }
     // 归档结果与接收帧数无关，未收到新报文时仍须更新。
     refresh_archive(runtime);
     displayed_runtime = *runtime;
@@ -838,7 +872,7 @@ static void create_receive_page(lv_obj_t *screen)
     const char *headers[] = {"CAN-ID", "类型", "DLC", "最新数据", "周期(ms)", "计数"};
     // 初始化列标题，数据单元格由统计刷新函数填充。
     for(uint32_t col = 0; col < 6; col++) {
-        lv_table_set_cell_value(table, 0, col, headers[col]);
+        set_table_cell_if_changed(table, 0, col, headers[col]);
     }
     bind_filter(&receive_filter, filter, clear, table, matches);
 }
@@ -928,7 +962,7 @@ static void create_playback_page(lv_obj_t *screen)
     const char *headers[] = {"时间(s)", "CAN-ID", "类型", "DLC", "Data"};
     for(unsigned i = 0; i < 5U; i++) {
         lv_table_set_column_width(preview_table, i, widths[i]);
-        lv_table_set_cell_value(preview_table, 0, i, headers[i]);
+        set_table_cell_if_changed(preview_table, 0, i, headers[i]);
     }
     player_display_valid = false;
     bind_filter(&history_filter, filter, clear, preview_table, preview_count_label);
@@ -950,6 +984,10 @@ void ui_init(void)
                                   lv_color_hex(0xE3B34E), 0);
     diagnostics_label = create_label(screen, "", 16, 119, 770,
                                      lv_color_hex(UI_COLOR_MUTED), 0);
+    // 利用页签右侧空白显示关键峰值，保留原有异常栏和表格空间。
+    performance_label = create_label(screen, "", 342, 56, 444,
+                                     lv_color_hex(UI_COLOR_MUTED), 0);
+    lv_obj_set_height(performance_label, 40);
     runtime_display_valid = false;
     displayed_total = UINT32_MAX;  // 保证启动时累计帧数为 0 仍执行首次刷新。
 
