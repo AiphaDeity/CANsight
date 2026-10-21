@@ -35,11 +35,13 @@ target_compile_definitions(lvgl PUBLIC
 # 创建可执行文件，并直接编译与 STM32 共用的界面实现
 add_executable(cansight_sim
     main.c
+    ../Core/Src/can_stats.c
     ../GUI/App/ui.c
     ../GUI/App/lv_font_cansight_14.c
 )
 target_include_directories(cansight_sim PRIVATE
     ../GUI/App
+    ../Core/Inc
 )
 
 # 链接库

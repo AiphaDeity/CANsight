@@ -32,6 +32,7 @@
 /* USER CODE BEGIN Includes */
 #include "stdio.h"
 #include "can_logger.h"
+#include "can_stats.h"
 #include "lv_port_disp.h"
 #include "lv_port_indev.h"
 #include "gt911.h"
@@ -47,6 +48,12 @@
 /* USER CODE BEGIN PD */
 // 队列大小
 #define CAN_RX_QUEUE_SIZE 64U
+/* 单次主循环的接收处理上限，防止持续来帧阻塞界面任务。 */
+#define CAN_RX_BATCH_SIZE 32U
+#ifndef CAN_RX_DEBUG_PRINT
+/* 逐帧串口诊断输出开关：1 为启用，0 为禁用；默认禁用以降低阻塞开销。 */
+#define CAN_RX_DEBUG_PRINT 0
+#endif
 
 #define CAN_RX_QUEUE_MASK (CAN_RX_QUEUE_SIZE - 1U) // 掩码，用于循环队列索引
 /* USER CODE END PD */
@@ -194,6 +201,7 @@ int main(void)
   lv_init();
   lv_port_disp_init();
   lv_port_indev_init();
+  CanStats_Init();  /* 在界面读取统计数据前完成模块初始化。 */
   ui_init();
 
   if(HAL_TIM_Base_Start(&htim2) != HAL_OK)
@@ -265,10 +273,16 @@ int main(void)
 
     CanFrame frame;
 
-    while (CAN_RxQueue_Pop(&frame) != 0U) {
+    /* 队列为空或达到处理上限后结束本批次，剩余报文留待下一轮处理。 */
+    for (uint32_t processed = 0U;
+         processed < CAN_RX_BATCH_SIZE && CAN_RxQueue_Pop(&frame) != 0U;
+         processed++) {
       /* 只在主循环里写日志；CAN 中断只负责接收并把数据放入队列。 */
       CanLogger_AddFrame(&frame);
+      /* 统计处理独立于日志可写状态及界面筛选条件。 */
+      CanStats_AddFrame(&frame);
 
+#if CAN_RX_DEBUG_PRINT
       const char *frameType = (frame.ide == CAN_ID_STD) ? "STD" : "EXT";
       const char *frameRTR = (frame.rtr == CAN_RTR_DATA) ? "DATA" : "REMOTE";
 
@@ -286,6 +300,7 @@ int main(void)
       }
 
       printf("\r\n");
+#endif
     }
 
     /* 定期把缓冲记录同步到卡；不在 CAN 中断里调用 FatFs。 */

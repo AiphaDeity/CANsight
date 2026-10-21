@@ -1,0 +1,35 @@
+#ifndef CAN_STATS_H
+#define CAN_STATS_H
+
+#include "can_logger.h"
+
+//最多保存 128 种 ID + IDE + RTR 组合，固定分配内存，不使用动态堆。
+#define CAN_STATS_CAPACITY 128U
+
+// 一条汇总记录：同一组合的新帧覆盖 latest，并更新计数和周期
+typedef struct {
+    CanFrame latest;       //最新一帧，包含时间戳、ID、格式、DLC 和数据
+    uint32_t count;        // 本次启动以来，该组合累计收到的帧数。
+    uint32_t period_us;    //最近两帧接收时间之差，单位微秒，不是平均周期。
+    uint8_t has_period;    //收到第二帧后置 1；只有第一帧时周期尚不可计算。 
+} CanStatsEntry;
+
+//启动时调用一次，清空条目和计数；不要在界面切换或筛选时调用
+void CanStats_Init(void);
+
+//主循环每取出一帧后调用；NULL 不计数，表满不影响已有条目更新
+void CanStats_AddFrame(const CanFrame *frame);
+
+/* 返回已占用的条目数量，不是总帧数，也不是筛选匹配数量。 */
+uint16_t CanStats_GetEntryCount(void);
+
+//按首次出现顺序读取条目；越界返回 NULL。
+const CanStatsEntry *CanStats_GetEntry(uint16_t index);
+
+//总数为交给统计模块的帧数，不包含接收队列之前丢失的帧
+uint32_t CanStats_GetTotalCount(void);
+
+//表满后无法建立新条目的帧数；已有条目仍继续更新
+uint32_t CanStats_GetUntrackedCount(void);
+
+#endif

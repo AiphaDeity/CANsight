@@ -1,4 +1,5 @@
 #include "ui.h"
+#include "can_stats.h"
 
 LV_FONT_DECLARE(lv_font_cansight_14);
 
@@ -13,23 +14,17 @@ static lv_obj_t *receive_page;
 static lv_obj_t *playback_page;
 static lv_obj_t *receive_tab;
 static lv_obj_t *playback_tab;
+static lv_obj_t *total_label;       /* 全局接收帧数标签。 */
+static lv_obj_t *capacity_label;    /* 统计表容量不足提示。 */
+static uint32_t displayed_total;    /* 上次刷新时的累计帧数。 */
+static uint16_t receive_offset;     /* 当前页在筛选结果中的起始偏移。 */
+#define RECEIVE_VISIBLE_ROWS 8U  /* 单页最大条目数，用于限制控件内存占用。 */
 
-/* 示例数据单独存放；筛选只改变显示，不删除收到的报文。 */
+/* 回放页保留示例数据；接收页使用统计模块提供的数据。 */
 typedef struct {
     uint32_t id;
     const char *cells[6];
 } ui_sample_t;
-
-static const ui_sample_t receive_samples[] = {
-    {0x7DF, {"0x7DF", "标准", "8", "02 01 0C 00 00 00 00 00", "--", "1"}},
-    {0x18FF5000, {"0x18FF5000", "扩展", "8", "00 00 00 00 00 00 00 00", "10", "8400"}},
-    {0x321, {"0x321", "标准", "2", "A5 5A", "20", "4210"}},
-    {0x18FEF100, {"0x18FEF100", "扩展", "8", "FF FF FF 00 12 34 56 78", "50", "1680"}},
-    {0x123, {"0x123", "标准", "4", "01 02 03 04", "100", "842"}},
-    {0x123, {"0x123", "扩展", "4", "0A 0B 0C 0D", "200", "421"}},
-    {0x237, {"0x237", "标准", "8", "12 27 65 74 83 92 87 33", "500", "168"}},
-    {0x7E8, {"0x7E8", "标准", "8", "04 41 0C 1A F8 00 00 00", "1000", "84"}}
-};
 
 static const ui_sample_t playback_samples[] = {
     {0x237, {"12.340", "0x237", "标准", "8", "12 27 65 74 83 92 87 33"}},
@@ -73,13 +68,78 @@ static bool parse_filter(const char *text, uint32_t *id, bool *all)
     return *id <= 0x1FFFFFFFU;
 }
 
+/* 根据筛选条件和分页偏移刷新接收表格，不修改底层统计。 */
+static void refresh_receive(ui_filter_t *filter)
+{
+    uint32_t id;
+    bool all;
+    bool valid = parse_filter(filter->text, &id, &all);  /* 空筛选条件匹配全部条目。 */
+    uint16_t selected[CAN_STATS_CAPACITY];  /* 匹配条目的索引列表，不复制报文数据。 */
+    uint16_t matches = 0;  /* 匹配条目数。 */
+    uint16_t count = CanStats_GetEntryCount();  /* 有效统计条目数。 */
+    for(uint16_t i = 0; i < count; i++) {
+        const CanStatsEntry *entry = CanStats_GetEntry(i);
+        if(valid && (all || entry->latest.id == id)) selected[matches++] = i;
+    }
+    /* 筛选结果变化或分页偏移越界时，重置为首页。 */
+    if(receive_offset >= matches) receive_offset = 0;
+    uint16_t visible = matches - receive_offset;
+    if(visible > RECEIVE_VISIBLE_ROWS) visible = RECEIVE_VISIBLE_ROWS;
+    lv_table_set_row_count(filter->table, visible + 1U);  /* 第 0 行为表头。 */
+    for(uint16_t i = 0; i < visible; i++) {
+        /* 将页面偏移映射为统计表索引。 */
+        const CanStatsEntry *entry = CanStats_GetEntry(selected[receive_offset + i]);
+        const CanFrame *frame = &entry->latest;
+        uint16_t row = i + 1U;
+        char text[32];
+        lv_snprintf(text, sizeof(text), "0x%lX", (unsigned long)frame->id);
+        lv_table_set_cell_value(filter->table, row, 0, text);
+        /* 使用 RTR 后缀区分远程帧与数据帧。 */
+        lv_snprintf(text, sizeof(text), "%s%s", frame->ide ? "扩展" : "标准",
+                    frame->rtr ? " RTR" : "");
+        lv_table_set_cell_value(filter->table, row, 1, text);
+        lv_snprintf(text, sizeof(text), "%u", (unsigned)frame->dlc);
+        lv_table_set_cell_value(filter->table, row, 2, text);
+        /* 8 字节数据格式化后最多为 23 个字符，不含字符串结束符。 */
+        unsigned used = 0;  /* 已写入的字符数。 */
+        text[0] = '\0';
+        if(frame->rtr == 0U) {  /* 远程帧不包含有效数据，数据列保持为空。 */
+            for(uint8_t j = 0; j < frame->dlc; j++) {
+                used += (unsigned)lv_snprintf(text + used, sizeof(text) - used,
+                    j ? " %02X" : "%02X", (unsigned)frame->data[j]);
+            }
+        }
+        lv_table_set_cell_value(filter->table, row, 3, text);
+        /* 使用整数运算将微秒转换为毫秒，并保留三位小数。 */
+        if(entry->has_period) {
+            lv_snprintf(text, sizeof(text), "%lu.%03lu",
+                        (unsigned long)(entry->period_us / 1000U),
+                        (unsigned long)(entry->period_us % 1000U));
+        }
+        else lv_snprintf(text, sizeof(text), "--");
+        lv_table_set_cell_value(filter->table, row, 4, text);
+        lv_snprintf(text, sizeof(text), "%lu", (unsigned long)entry->count);
+        lv_table_set_cell_value(filter->table, row, 5, text);
+    }
+    /* 更新匹配条目数、当前显示范围及筛选输入状态。 */
+    if(!valid) lv_label_set_text(filter->matches, "ID 格式错误");
+    else lv_label_set_text_fmt(filter->matches, "匹配 %u / 共 %u  [%u-%u]",
+        (unsigned)matches, (unsigned)count,
+        matches ? (unsigned)receive_offset + 1U : 0U,
+        (unsigned)(receive_offset + visible));
+    lv_obj_set_style_border_color(filter->input,
+        lv_color_hex(valid ? UI_COLOR_LINE : 0xE35B5B), LV_PART_MAIN);
+}
+
 static void refresh_filter(ui_filter_t *filter)
 {
-    const ui_sample_t *samples = filter->playback ? playback_samples : receive_samples;
-    uint32_t count = filter->playback ?
-        sizeof(playback_samples) / sizeof(playback_samples[0]) :
-        sizeof(receive_samples) / sizeof(receive_samples[0]);
-    uint32_t columns = filter->playback ? 5 : 6;
+    if(!filter->playback) {
+        refresh_receive(filter);
+        return;
+    }
+    const ui_sample_t *samples = playback_samples;
+    uint32_t count = sizeof(playback_samples) / sizeof(playback_samples[0]);
+    uint32_t columns = 5;
     uint32_t id;
     bool all;
     bool valid = parse_filter(filter->text, &id, &all);
@@ -99,12 +159,8 @@ static void refresh_filter(ui_filter_t *filter)
     }
     lv_obj_scroll_to_y(filter->table, 0, LV_ANIM_OFF);
     if(!valid) lv_label_set_text(filter->matches, "ID 格式错误");
-    else if(filter->playback) {
-        lv_label_set_text_fmt(filter->matches, "匹配 %u / 共 %u 帧",
-                             (unsigned)matches, (unsigned)count);
-    }
     else {
-        lv_label_set_text_fmt(filter->matches, "匹配 %u / 共 %u 种 ID/帧格式",
+        lv_label_set_text_fmt(filter->matches, "匹配 %u / 共 %u 帧",
                              (unsigned)matches, (unsigned)count);
     }
     lv_obj_set_style_border_color(filter->input,
@@ -161,6 +217,8 @@ static void filter_changed_cb(lv_event_t *event)
 {
     ui_filter_t *filter = lv_event_get_user_data(event);
     lv_snprintf(filter->text, sizeof(filter->text), "%s", lv_textarea_get_text(filter->input));
+    /* 筛选条件变更后重置分页，并立即更新显示。 */
+    if(!filter->playback) receive_offset = 0;
     refresh_filter(filter);
 }
 
@@ -171,6 +229,7 @@ static void filter_clear_cb(lv_event_t *event)
     lv_textarea_set_text(filter->input, "");
     /* 带字符限制的输入框，设置空字符串不一定触发 VALUE_CHANGED。 */
     filter->text[0] = '\0';
+    if(!filter->playback) receive_offset = 0;
     refresh_filter(filter);
 }
 
@@ -304,6 +363,25 @@ static void tab_event_cb(lv_event_t *event)
     show_page(show_playback);
 }
 
+/**
+ * @brief 周期更新统计显示。
+ * @note 周期为 100 ms，由主循环中的 lv_timer_handler() 调度，不在中断中执行。
+ */
+static void stats_timer_cb(lv_timer_t *timer)
+{
+    (void)timer;
+    uint32_t total = CanStats_GetTotalCount();
+    if(total == displayed_total) return;  /* 统计未变化时跳过控件更新。 */
+    displayed_total = total;
+    lv_label_set_text_fmt(total_label, "总帧数 %lu", (unsigned long)total);
+    if(CanStats_GetUntrackedCount() != 0U) {
+        lv_label_set_text_fmt(capacity_label, "ID table full; not listed: %lu frames",
+                             (unsigned long)CanStats_GetUntrackedCount());
+    }
+    /* 页面切换可能已释放接收页控件，仅在控件有效时更新。 */
+    if(receive_filter.table != NULL) refresh_receive(&receive_filter);
+}
+
 //创建状态栏
 static void create_status_bar(lv_obj_t *screen)
 {
@@ -321,7 +399,21 @@ static void create_status_bar(lv_obj_t *screen)
     create_label(bar, "● CAN1 运行中", 150, 13, 150, lv_color_hex(0x43D17A), 0);
     create_label(bar, "500 kbit/s", 325, 13, 110, lv_color_hex(UI_COLOR_TEXT), 0);
     create_label(bar, "● SD 记录中", 475, 13, 130, lv_color_hex(0x43D17A), 0);
-    create_label(bar, "总帧数 15806", 655, 13, 130, lv_color_hex(UI_COLOR_TEXT), 0);
+    total_label = create_label(bar, "总帧数 0", 630, 13, 165, lv_color_hex(UI_COLOR_TEXT), 0);
+}
+
+/* 处理接收页分页事件。 */
+static void receive_page_cb(lv_event_t *event)
+{
+    /* 事件用户数据非空表示下一页，为 NULL 表示上一页。 */
+    if(lv_event_get_user_data(event) != NULL) {
+        receive_offset += RECEIVE_VISIBLE_ROWS;
+    }
+    else if(receive_offset >= RECEIVE_VISIBLE_ROWS) {
+        receive_offset -= RECEIVE_VISIBLE_ROWS;
+    }
+    /* 统一在刷新函数中处理分页越界。 */
+    refresh_receive(&receive_filter);
 }
 
 //创建 CAN 接收页面的 UI 组件
@@ -344,25 +436,29 @@ static void create_receive_page(lv_obj_t *screen)
     lv_obj_set_style_bg_color(filter, lv_color_hex(0x101318), LV_PART_MAIN);
     lv_obj_set_style_text_color(filter, lv_color_hex(UI_COLOR_TEXT), LV_PART_MAIN);
     lv_obj_t *clear = create_button(receive_page, "清除", 272, 0, 68, 36, false);
-    lv_obj_t *matches = create_label(receive_page, "", 540, 9, 245,
+    lv_obj_t *previous = create_button(receive_page, "<", 352, 0, 36, 36, false);
+    lv_obj_t *next = create_button(receive_page, ">", 394, 0, 36, 36, false);
+    lv_obj_add_event_cb(previous, receive_page_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_add_event_cb(next, receive_page_cb, LV_EVENT_CLICKED, &receive_offset);
+    lv_obj_t *matches = create_label(receive_page, "", 442, 9, 345,
                  lv_color_hex(UI_COLOR_MUTED), 0);
 
-    //数据表格：6 列布局，表头 + 8 行示例数据
+    /* 仅为当前页分配表格行，单页最多显示 8 条统计记录。 */
     lv_obj_t *table = lv_table_create(receive_page);
     style_data_table(table);
     lv_obj_set_pos(table, 12, 48);
     lv_obj_set_size(table, 776, 280);
     lv_table_set_column_count(table, 6);
-    lv_table_set_row_count(table, 9);
+    lv_table_set_row_count(table, 1);
     lv_table_set_column_width(table, 0, 125);
-    lv_table_set_column_width(table, 1, 78);
-    lv_table_set_column_width(table, 2, 65);
-    lv_table_set_column_width(table, 3, 280);
+    lv_table_set_column_width(table, 1, 100);
+    lv_table_set_column_width(table, 2, 48);
+    lv_table_set_column_width(table, 3, 265);
     lv_table_set_column_width(table, 4, 115);
-    lv_table_set_column_width(table, 5, 75);
+    lv_table_set_column_width(table, 5, 100);
 
     const char *headers[] = {"CAN-ID", "类型", "DLC", "最新数据", "周期(ms)", "计数"};
-    //设置表头，示例报文由筛选刷新函数填充
+    /* 初始化列标题，数据单元格由统计刷新函数填充。 */
     for(uint32_t col = 0; col < 6; col++) {
         lv_table_set_cell_value(table, 0, col, headers[col]);
     }
@@ -456,6 +552,9 @@ void ui_init(void)
 
     //创建顶部状态栏，显示应用名称和CAN总线状态信息 
     create_status_bar(screen);
+    capacity_label = create_label(screen, "", 16, 110, 770,
+                                  lv_color_hex(0xE3B34E), 0);
+    displayed_total = UINT32_MAX;  /* 保证启动时累计帧数为 0 仍执行首次刷新。 */
 
     //创建"接收"和"SD 回放"两个标签页切换按钮
     receive_tab = create_button(screen, "接收", 12, 54, 150, 42, true);
@@ -468,4 +567,6 @@ void ui_init(void)
 
     //默认显示接收页面
     show_page(false);
+    stats_timer_cb(NULL);  /* 初始化统计显示。 */
+    lv_timer_create(stats_timer_cb, 100, NULL);  /* 注册周期刷新任务，仅在界面初始化时创建。 */
 }

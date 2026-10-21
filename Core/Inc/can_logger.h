@@ -17,7 +17,7 @@ typedef struct
 /* 挂载 SD 卡并打开 CANLOG.CSV；失败时 CAN 接收仍可继续。 */
 uint8_t CanLogger_Init(void);
 
-/* 将一帧报文追加到 RAM 缓冲区，不执行文件系统操作。 */
+/* 主循环调用：追加到 RAM 缓冲区，空间不足时先写卡。 */
 void CanLogger_AddFrame(const CanFrame *frame);
 
 /* 主循环调用：缓冲区满时写卡，每秒同步一次文件。 */

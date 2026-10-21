@@ -54,6 +54,7 @@ target_link_directories(${CMAKE_PROJECT_NAME} PRIVATE
 target_sources(${CMAKE_PROJECT_NAME} PRIVATE
     # Add user sources here
     ${CMAKE_CURRENT_SOURCE_DIR}/Core/Src/can_logger.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/Core/Src/can_stats.c
     ${CMAKE_CURRENT_SOURCE_DIR}/GUI/Port/lv_port_disp.c
     ${CMAKE_CURRENT_SOURCE_DIR}/GUI/Port/lv_port_indev.c
     ${CMAKE_CURRENT_SOURCE_DIR}/GUI/Board/LCD/lcd.c
