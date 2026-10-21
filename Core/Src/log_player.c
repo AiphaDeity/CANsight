@@ -60,6 +60,7 @@ static uint32_t checkpoint_stride;
 static uint32_t line_offset;                // 正在拼接的文本行在文件中的绝对字节位置。
 static uint8_t building_index;
 static uint8_t read_turn;                   // 目录与文件同时打开时交替推进，防止翻页长期等待。
+static uint8_t release_pending;             // 快速退出再进入历史页时，也须释放上一轮读取资源。
 
 // 重建时立即清除旧结果，避免筛选条件与旧文件窗口混合显示。
 static void reset_browser(void)
@@ -147,6 +148,7 @@ void LogPlayer_Init(const char *root)
     view.revision = 1U;  // 使用非零初始版本，使界面可以识别初始化后的数据。
     active = query_pending = open_pending = storage_pending = 0U;
     checkpoint_count = building_index = read_turn = 0U;
+    release_pending = 0U;
 #ifndef CAN_PLAYER_SIMULATOR
     archive_revision = CanLogger_GetArchiveRevision();
 #endif
@@ -157,6 +159,13 @@ void LogPlayer_SetActive(uint8_t enabled)
 {
     active = enabled;
     if(!enabled) {
+        release_pending = 1U;
+        // 退出时立即撤销未完成窗口，避免快速切回后继续使用已取消的解析状态。
+        if(view.preview_state == LOG_PREVIEW_LOADING || view.preview_state == LOG_PREVIEW_INDEXING) {
+            view.preview_state = LOG_PREVIEW_IDLE;
+            view.frame_count = view.index_ready = 0U;
+            view.revision++;
+        }
         query_pending = open_pending = storage_pending = 0U;
         // 尚未执行的删除随页面退出取消，已完成的操作不受影响。
         if(view.delete_state == LOG_DELETE_PENDING) view.delete_state = LOG_DELETE_IDLE;
@@ -779,6 +788,14 @@ void LogPlayer_Process(void)
         }
         return;
     }
+    if(release_pending) {
+        release_pending = 0U;
+        uint32_t error = close_reader();
+        if(error) preview_failed(LOG_PREVIEW_IO_ERROR, error);
+        error = close_directory();
+        if(error) list_failed(error);
+        if(close_error) return;
+    }
     if(!active) {
         // 页面退出后释放资源；已完成的预览保留，未完成的预览取消。
         uint32_t error = close_reader();
@@ -838,7 +855,7 @@ void LogPlayer_Process(void)
 // 模拟器据此缩短空闲等待时间，不代表本模块使用独立线程。
 uint8_t LogPlayer_IsBusy(void)
 {
-    return active && !close_error && (query_pending || open_pending || directory_open || reader_open ||
+    return active && !close_error && (release_pending || query_pending || open_pending || directory_open || reader_open ||
         storage_pending || view.delete_state == LOG_DELETE_PENDING);
 }
 
