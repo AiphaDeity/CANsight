@@ -1,5 +1,6 @@
 #include "ui.h"
 #include "can_stats.h"
+#include <string.h>
 
 LV_FONT_DECLARE(lv_font_cansight_14);
 
@@ -19,6 +20,10 @@ static lv_obj_t *capacity_label;    // 统计表容量不足提示。
 static lv_obj_t *can_status_label;
 static lv_obj_t *sd_status_label;
 static lv_obj_t *diagnostics_label;
+static ui_archive_callback_t archive_callback;
+static lv_obj_t *archive_notice;
+static lv_obj_t *archive_name_label;
+static lv_obj_t *active_log_label;
 static CanStatsRuntime displayed_runtime;
 static bool runtime_display_valid;
 static uint32_t displayed_total;    // 上次刷新时的累计帧数。
@@ -324,6 +329,29 @@ static lv_obj_t *create_button(lv_obj_t *parent, const char *text,
 static void create_receive_page(lv_obj_t *screen);
 static void create_playback_page(lv_obj_t *screen);
 
+void ui_set_archive_callback(ui_archive_callback_t callback)
+{
+    archive_callback = callback;
+}
+
+// 页面切换与手动按钮共用归档请求接口，避免界面依赖 FatFs 或 HAL。
+static void request_archive(void)
+{
+    if(archive_callback != NULL) {
+        if(archive_notice != NULL) lv_label_set_text(archive_notice, "Archive requested...");
+        archive_callback();
+    }
+    else if(archive_notice != NULL) {
+        lv_label_set_text(archive_notice, "Simulator: no SD card");
+    }
+}
+
+static void archive_event_cb(lv_event_t *event)
+{
+    (void)event;
+    request_archive();
+}
+
 static void show_page(bool show_playback)
 {
     close_hex_keyboard();
@@ -337,6 +365,7 @@ static void show_page(bool show_playback)
         }
         if(playback_page == NULL) {
             create_playback_page(screen);
+            request_archive();
         }
     }
     else {
@@ -344,6 +373,7 @@ static void show_page(bool show_playback)
             lv_obj_delete(playback_page);
             playback_page = NULL;
             playback_filter.input = playback_filter.table = playback_filter.matches = NULL;
+            archive_notice = archive_name_label = active_log_label = NULL;
         }
         if(receive_page == NULL) {
             create_receive_page(screen);
@@ -372,6 +402,41 @@ static void tab_event_cb(lv_event_t *event)
  * @brief 更新运行状态及接收异常提示。
  * @note 周期为 100 ms，由主循环中的 lv_timer_handler() 调度，不在中断中执行。
  */
+static const char *fatfs_error_name(uint32_t error)
+{
+    // 错误值对应当前 FatFs ff.h 的 FRESULT 定义，模拟器不依赖文件系统头文件。
+    static const char * const names[] = {
+        "FR_OK", "FR_DISK_ERR", "FR_INT_ERR", "FR_NOT_READY", "FR_NO_FILE",
+        "FR_NO_PATH", "FR_INVALID_NAME", "FR_DENIED", "FR_EXIST", "FR_INVALID_OBJECT",
+        "FR_WRITE_PROTECTED", "FR_INVALID_DRIVE", "FR_NOT_ENABLED", "FR_NO_FILESYSTEM",
+        "FR_MKFS_ABORTED", "FR_TIMEOUT", "FR_LOCKED", "FR_NOT_ENOUGH_CORE",
+        "FR_TOO_MANY_OPEN_FILES", "FR_INVALID_PARAMETER"
+    };
+    return error < sizeof(names) / sizeof(names[0]) ? names[error] : "FR_UNKNOWN";
+}
+
+// 更新归档结果，历史文件的枚举与报文读取在后续阶段实现。
+static void refresh_archive(const CanStatsRuntime *runtime)
+{
+    if(archive_notice == NULL) return;
+    const char *notice;
+    if(archive_callback == NULL) notice = "Simulator: no SD card";
+    else switch(runtime->archive_state) {
+        case CAN_ARCHIVE_PENDING: notice = "Archiving..."; break;
+        case CAN_ARCHIVE_DONE: notice = "Archive complete"; break;
+        case CAN_ARCHIVE_EMPTY: notice = "No frames; archive skipped"; break;
+        case CAN_ARCHIVE_FAILED: notice = "Archive failed; check SD"; break;
+        default: notice = "No archive request"; break;
+    }
+    const char *name = runtime->archive_name[0] ? runtime->archive_name : "None this session";
+    const char *active = runtime->sd_state == CAN_LOG_RECORDING ?
+        "CANLOG.CSV\n正在记录，暂不可回放" : "CANLOG.CSV\n记录未就绪";
+    // 仅在文字变化时重新分配标签文本，减少周期刷新产生的动态内存操作。
+    if(strcmp(lv_label_get_text(archive_notice), notice) != 0) lv_label_set_text(archive_notice, notice);
+    if(strcmp(lv_label_get_text(archive_name_label), name) != 0) lv_label_set_text(archive_name_label, name);
+    if(strcmp(lv_label_get_text(active_log_label), active) != 0) lv_label_set_text(active_log_label, active);
+}
+
 static void refresh_runtime(void)
 {
     const CanStatsRuntime *runtime = CanStats_GetRuntime();
@@ -409,13 +474,16 @@ static void refresh_runtime(void)
        runtime->error_flags != displayed_runtime.error_flags ||
        runtime->sd_error != displayed_runtime.sd_error) {
         lv_label_set_text_fmt(diagnostics_label,
-            "Queue lost: %lu | FIFO overruns: %lu | HAL: 0x%08lX | SD: %lu",
+            "Queue lost: %lu | FIFO overruns: %lu | HAL: 0x%08lX | SD: %lu (%s)",
             (unsigned long)runtime->queue_lost, (unsigned long)runtime->fifo_overruns,
-            (unsigned long)runtime->error_flags, (unsigned long)runtime->sd_error);
+            (unsigned long)runtime->error_flags, (unsigned long)runtime->sd_error,
+            fatfs_error_name(runtime->sd_error));
         lv_obj_set_style_text_color(diagnostics_label, lv_color_hex(
             runtime->queue_lost || runtime->fifo_overruns || runtime->error_flags ||
             runtime->sd_error ? 0xE3B34E : UI_COLOR_MUTED), LV_PART_MAIN);
     }
+    // 归档结果与接收帧数无关，未收到新报文时仍须更新。
+    refresh_archive(runtime);
     displayed_runtime = *runtime;
     runtime_display_valid = true;
 }
@@ -541,16 +609,22 @@ static void create_playback_page(lv_obj_t *screen)
     lv_obj_set_style_border_color(file_panel, lv_color_hex(UI_COLOR_LINE), LV_PART_MAIN);
     lv_obj_set_style_pad_all(file_panel, 6, LV_PART_MAIN);
     lv_obj_set_scroll_dir(file_panel, LV_DIR_VER);
-    create_button(file_panel, "CANLOG_001.CSV", 4, 4, 168, 38, true);
-    create_label(file_panel, "CANLOG_002.CSV", 12, 58, 160, lv_color_hex(UI_COLOR_TEXT), 0);
-    create_label(file_panel, "CANLOG_003.CSV", 12, 98, 160, lv_color_hex(UI_COLOR_TEXT), 0);
-    create_label(file_panel, "……", 12, 142, 160, lv_color_hex(UI_COLOR_MUTED), 0);
-    create_label(file_panel, "CANLOG.CSV\n正在记录，暂不可回放", 8, 238, 158,
+    create_label(file_panel, "Last archived file:", 8, 8, 158, lv_color_hex(UI_COLOR_MUTED), 0);
+    archive_name_label = create_label(file_panel, "", 8, 38, 158,
+                                      lv_color_hex(UI_COLOR_TEXT), 0);
+    create_label(file_panel, "History list:\nnext stage", 8, 80, 158,
                  lv_color_hex(UI_COLOR_MUTED), 0);
+    lv_obj_t *archive_button = create_button(file_panel, "Archive log", 4, 132, 168, 36, false);
+    lv_obj_add_event_cb(archive_button, archive_event_cb, LV_EVENT_CLICKED, NULL);
+    archive_notice = create_label(file_panel, "", 8, 180, 158,
+                                  lv_color_hex(UI_COLOR_MUTED), 0);
+    active_log_label = create_label(file_panel, "", 8, 238, 158,
+                 lv_color_hex(UI_COLOR_MUTED), 0);
+    refresh_archive(CanStats_GetRuntime());
 
     //右侧内容区域 - 文件名和帧统计信息 
-    create_label(playback_page, "CANLOG_001.CSV", 216, 4, 300, lv_color_hex(UI_COLOR_TEXT), 0);
-    create_label(playback_page, "第 128 帧 / 共 5230 帧", 565, 4, 220,
+    create_label(playback_page, "Sample data (playback pending)", 216, 4, 340, lv_color_hex(UI_COLOR_TEXT), 0);
+    create_label(playback_page, "-- / --", 660, 4, 125,
                  lv_color_hex(UI_COLOR_MUTED), 0);
 
 
@@ -558,8 +632,8 @@ static void create_playback_page(lv_obj_t *screen)
     lv_obj_t *progress = lv_bar_create(playback_page);
     lv_obj_set_pos(progress, 210, 30);
     lv_obj_set_size(progress, 578, 8);
-    lv_bar_set_range(progress, 0, 5230);
-    lv_bar_set_value(progress, 128, LV_ANIM_OFF);
+    lv_bar_set_range(progress, 0, 100);
+    lv_bar_set_value(progress, 0, LV_ANIM_OFF);
 
     //播放控制按钮组
     create_button(playback_page, "上一帧", 210, 49, 95, 40, false);

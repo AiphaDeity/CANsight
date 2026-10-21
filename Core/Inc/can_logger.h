@@ -22,17 +22,38 @@ typedef enum {
   CAN_LOG_ERROR           // 日志打开、格式化、写入或同步失败。
 } CanLoggerState;
 
+#define CAN_LOG_ARCHIVE_NAME_SIZE 24U
+
+// 归档请求的处理状态，与日志写入状态分别维护。
+typedef enum {
+  CAN_ARCHIVE_IDLE = 0,
+  CAN_ARCHIVE_PENDING,
+  CAN_ARCHIVE_DONE,
+  CAN_ARCHIVE_EMPTY,
+  CAN_ARCHIVE_FAILED
+} CanArchiveState;
+
+/**
+ * @brief 请求归档当前日志，并创建新的活动日志。
+ * @return 请求受理时返回 1；日志不可用或已有请求待处理时返回 0。
+ * @note 仅提交请求，文件操作由主循环中的 CanLogger_Process() 执行。
+ */
+uint8_t CanLogger_RequestArchive(void);
+CanArchiveState CanLogger_GetArchiveState(void);
+// 返回最近成功归档的文件名，只读，无归档记录时为空字符串。
+const char *CanLogger_GetLastArchiveName(void);
+
 // 获取日志状态及最近一次 FatFs 错误码，仅读取模块状态。
 CanLoggerState CanLogger_GetState(void);
 uint32_t CanLogger_GetLastError(void);
 
-// 挂载 SD 卡并打开 CANLOG.CSV；失败时 CAN 接收仍可继续。
+// 挂载 SD 卡，归档已有的非空日志，并打开新的活动日志。
 uint8_t CanLogger_Init(void);
 
 // 主循环调用：追加到 RAM 缓冲区，空间不足时先写卡。
 void CanLogger_AddFrame(const CanFrame *frame);
 
-// 主循环调用：缓冲区满时写卡，每秒同步一次文件。
+// 主循环调用：处理归档请求，并约每秒写出缓冲及同步文件。
 void CanLogger_Process(void);
 
 // 返回 1 表示本次运行中的 SD 日志仍可写。

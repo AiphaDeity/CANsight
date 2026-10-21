@@ -29,6 +29,8 @@ typedef struct {
     uint32_t fifo_overruns;    // FIFO 溢出事件数，不等同于精确丢帧数。
     uint32_t error_flags;      // 本次启动累计发生的 HAL CAN 错误位。
     uint32_t sd_error;         // 最近一次 FatFs 错误码。
+    CanArchiveState archive_state;
+    char archive_name[CAN_LOG_ARCHIVE_NAME_SIZE];  // 最近成功归档的文件名。
 } CanStatsRuntime;
 
 /**

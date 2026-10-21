@@ -126,7 +126,16 @@ static void CAN_PublishRuntime(void)
   runtime.error_flags = canHalErrorFlags | HAL_CAN_GetError(&hcan1);
   runtime.sd_state = CanLogger_GetState();
   runtime.sd_error = CanLogger_GetLastError();
+  runtime.archive_state = CanLogger_GetArchiveState();
+  snprintf(runtime.archive_name, sizeof(runtime.archive_name), "%s",
+           CanLogger_GetLastArchiveName());
   CanStats_SetRuntime(&runtime);
+}
+
+// 界面回调仅提交请求，不在 LVGL 事件中直接访问文件系统。
+static void CAN_RequestArchive(void)
+{
+  (void)CanLogger_RequestArchive();
 }
 
 
@@ -234,6 +243,7 @@ int main(void)
   lv_port_disp_init();
   lv_port_indev_init();
   CanStats_Init();  // 在界面读取统计数据前完成模块初始化。
+  ui_set_archive_callback(CAN_RequestArchive);
   ui_init();
 
   if(HAL_TIM_Base_Start(&htim2) != HAL_OK)
