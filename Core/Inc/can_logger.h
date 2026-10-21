@@ -3,27 +3,39 @@
 
 #include <stdint.h>
 
-/* CAN 接收中断和主循环共用的一帧经典 CAN 报文。 */
+// CAN 接收中断和主循环共用的一帧经典 CAN 报文。
 typedef struct
 {
-  uint32_t timestamp_us; /* TIM2 微秒计数；32 位计数约每 71.6 分钟回绕一次。 */
-  uint32_t id;           /* 标准帧或扩展帧标识符。 */
-  uint8_t ide;           /* CAN_ID_STD 或 CAN_ID_EXT。 */
-  uint8_t rtr;           /* CAN_RTR_DATA 或 CAN_RTR_REMOTE。 */
-  uint8_t dlc;           /* 经典 CAN 数据长度，范围 0 到 8。 */
-  uint8_t data[8];       /* 数据帧内容；远程帧没有有效数据。 */
+  uint32_t timestamp_us; // TIM2 微秒计数；32 位计数约每 71.6 分钟回绕一次。
+  uint32_t id;           // 标准帧或扩展帧标识符。
+  uint8_t ide;           // CAN_ID_STD 或 CAN_ID_EXT。
+  uint8_t rtr;           // CAN_RTR_DATA 或 CAN_RTR_REMOTE。
+  uint8_t dlc;           // 经典 CAN 数据长度，范围 0 到 8。
+  uint8_t data[8];       // 数据帧内容；远程帧没有有效数据。
 } CanFrame;
 
-/* 挂载 SD 卡并打开 CANLOG.CSV；失败时 CAN 接收仍可继续。 */
+// SD 日志模块的当前状态，不等同于物理插卡检测结果。
+typedef enum {
+  CAN_LOG_UNMOUNTED = 0,  // 文件系统尚未成功挂载。
+  CAN_LOG_READY,          // 文件系统已挂载，活动日志尚未就绪。
+  CAN_LOG_RECORDING,      // 活动日志已打开，可接受接收记录。
+  CAN_LOG_ERROR           // 日志打开、格式化、写入或同步失败。
+} CanLoggerState;
+
+// 获取日志状态及最近一次 FatFs 错误码，仅读取模块状态。
+CanLoggerState CanLogger_GetState(void);
+uint32_t CanLogger_GetLastError(void);
+
+// 挂载 SD 卡并打开 CANLOG.CSV；失败时 CAN 接收仍可继续。
 uint8_t CanLogger_Init(void);
 
-/* 主循环调用：追加到 RAM 缓冲区，空间不足时先写卡。 */
+// 主循环调用：追加到 RAM 缓冲区，空间不足时先写卡。
 void CanLogger_AddFrame(const CanFrame *frame);
 
-/* 主循环调用：缓冲区满时写卡，每秒同步一次文件。 */
+// 主循环调用：缓冲区满时写卡，每秒同步一次文件。
 void CanLogger_Process(void);
 
-/* 返回 1 表示本次运行中的 SD 日志仍可写。 */
+// 返回 1 表示本次运行中的 SD 日志仍可写。
 uint8_t CanLogger_IsReady(void);
 
 #endif /* CAN_LOGGER_H */

@@ -273,4 +273,10 @@ void DMA2_Stream6_IRQHandler(void)
 
 /* USER CODE BEGIN 1 */
 
+// 处理 CAN1 状态变化和协议错误中断。
+void CAN1_SCE_IRQHandler(void)
+{
+  HAL_CAN_IRQHandler(&hcan1);
+}
+
 /* USER CODE END 1 */

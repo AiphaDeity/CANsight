@@ -48,10 +48,10 @@
 /* USER CODE BEGIN PD */
 // 队列大小
 #define CAN_RX_QUEUE_SIZE 64U
-/* 单次主循环的接收处理上限，防止持续来帧阻塞界面任务。 */
+// 单次主循环的接收处理上限，防止持续来帧阻塞界面任务。
 #define CAN_RX_BATCH_SIZE 32U
 #ifndef CAN_RX_DEBUG_PRINT
-/* 逐帧串口诊断输出开关：1 为启用，0 为禁用；默认禁用以降低阻塞开销。 */
+// 逐帧串口诊断输出开关：1 为启用，0 为禁用；默认禁用以降低阻塞开销。
 #define CAN_RX_DEBUG_PRINT 0
 #endif
 
@@ -85,6 +85,7 @@ static volatile uint32_t canRxFifo0OverrunEvents = 0U;
 
 //HAL 报告过的 CAN 错误位集合，便于调试时查看
 static volatile uint32_t canHalErrorFlags = 0U;
+static uint8_t canStartupFailed = 0U;  // 初始化、过滤器配置或启动失败标志。
 
 /* USER CODE END PV */
 
@@ -96,6 +97,37 @@ void SystemClock_Config(void);
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
+
+/**
+ * @brief 将控制器状态、日志状态及接收异常计数发布至界面数据层。
+ * @note 错误历史与当前状态分别维护，历史错误不阻止正常状态恢复。
+ */
+static void CAN_PublishRuntime(void)
+{
+  CanStatsRuntime runtime = {0};  // 运行时数据
+  HAL_CAN_StateTypeDef state = HAL_CAN_GetState(&hcan1);  // 获取控制器状态 
+  uint32_t esr = READ_REG(hcan1.Instance->ESR);  // 获取错误状态寄存器
+
+  if(canStartupFailed != 0U || state == HAL_CAN_STATE_ERROR ||
+     (esr & (CAN_ESR_EWGF | CAN_ESR_EPVF | CAN_ESR_BOFF)) != 0U) {
+    runtime.can_state = CAN_STATS_ERROR;
+  }
+  else if(state == HAL_CAN_STATE_LISTENING)
+  {
+    runtime.can_state = CAN_STATS_RUNNING;
+  }
+  else {
+    runtime.can_state = CAN_STATS_STOPPED;
+  }
+
+  // 对齐的 32 位计数可直接读取；各项是相邻时刻的独立快照，不要求原子组合。
+  runtime.queue_lost = canRxQueueOverflow;
+  runtime.fifo_overruns = canRxFifo0OverrunEvents;
+  runtime.error_flags = canHalErrorFlags | HAL_CAN_GetError(&hcan1);
+  runtime.sd_state = CanLogger_GetState();
+  runtime.sd_error = CanLogger_GetLastError();
+  CanStats_SetRuntime(&runtime);
+}
 
 
 /*
@@ -201,7 +233,7 @@ int main(void)
   lv_init();
   lv_port_disp_init();
   lv_port_indev_init();
-  CanStats_Init();  /* 在界面读取统计数据前完成模块初始化。 */
+  CanStats_Init();  // 在界面读取统计数据前完成模块初始化。
   ui_init();
 
   if(HAL_TIM_Base_Start(&htim2) != HAL_OK)
@@ -219,7 +251,7 @@ int main(void)
   }
 
 
-  /*CAN1过滤器配置，ID和Mask都设为0，表示接收所有符合格式的报文。*/
+  // CAN1过滤器配置，ID和Mask都设为0，表示接收所有符合格式的报文。
   CAN_FilterTypeDef canFilter = {0};
 
   canFilter.FilterBank = 0;                      // 使用过滤器组 0
@@ -235,27 +267,31 @@ int main(void)
   canFilter.SlaveStartFilterBank = 14; // CAN1/CAN2 共用过滤器的分界值
 
   //收到报文时通知：FIFO0溢出时也通知
-  uint32_t canNotifications = CAN_IT_RX_FIFO0_MSG_PENDING | CAN_IT_RX_FIFO0_OVERRUN;
+  uint32_t canNotifications = CAN_IT_RX_FIFO0_MSG_PENDING | CAN_IT_RX_FIFO0_OVERRUN |
+      CAN_IT_ERROR_WARNING | CAN_IT_ERROR_PASSIVE | CAN_IT_BUSOFF |
+      CAN_IT_LAST_ERROR_CODE | CAN_IT_ERROR;
 
-  /* 将过滤器配置写入 CAN1 */
-  if (HAL_CAN_ConfigFilter(&hcan1, &canFilter) != HAL_OK) {
-    /* 过滤器配置失败，进入错误处理 */
-    Error_Handler();
+  // 逐项确认初始化与启动结果，失败时保留界面及日志任务运行。
+  if (HAL_CAN_GetState(&hcan1) != HAL_CAN_STATE_READY ||
+      HAL_CAN_ConfigFilter(&hcan1, &canFilter) != HAL_OK ||
+      HAL_CAN_Start(&hcan1) != HAL_OK ||
+      HAL_CAN_ActivateNotification(&hcan1, canNotifications) != HAL_OK) {
+    canStartupFailed = 1U;
+    canHalErrorFlags |= HAL_CAN_GetError(&hcan1);
+    // 部分启动成功后通知配置失败时，停止控制器，避免未处理的中断持续触发。
+    if(HAL_CAN_GetState(&hcan1) == HAL_CAN_STATE_LISTENING) {
+      (void)HAL_CAN_Stop(&hcan1);
+    }
+    printf("CAN1 start failed, HAL error=0x%08lX\r\n", (unsigned long)canHalErrorFlags);
+  }
+  else {
+    // 错误状态中断独立于 RX0 中断，确保无接收报文时仍能记录总线错误。
+    HAL_NVIC_SetPriority(CAN1_SCE_IRQn, 0, 0);
+    HAL_NVIC_EnableIRQ(CAN1_SCE_IRQn);
+    printf("CAN1 Sight Start\r\n");
   }
 
-  /* 启动 CAN1 */
-  if (HAL_CAN_Start(&hcan1) != HAL_OK) {
-    /* CAN 启动失败，进入错误处理 */
-    Error_Handler();
-  }
-
-  if (HAL_CAN_ActivateNotification(&hcan1, canNotifications) !=
-      HAL_OK) {
-    /* 激活中断失败，进入错误处理 */
-    Error_Handler();
-  }
-
-  printf("CAN1 Sight Start\r\n");
+  CAN_PublishRuntime();
 
   /* USER CODE END 2 */
 
@@ -266,6 +302,8 @@ int main(void)
 
     /* USER CODE BEGIN 3 */
 
+    // 每轮更新状态快照，确保未接收新报文时，状态和异常提示仍可刷新。
+    CAN_PublishRuntime();
     // 处理界面刷新、触摸输入和 LVGL 定时任务
     lv_timer_handler();
     // 给LVGL留出运行间隔；5ms是初始值
@@ -273,13 +311,13 @@ int main(void)
 
     CanFrame frame;
 
-    /* 队列为空或达到处理上限后结束本批次，剩余报文留待下一轮处理。 */
+    // 队列为空或达到处理上限后结束本批次，剩余报文留待下一轮处理。
     for (uint32_t processed = 0U;
          processed < CAN_RX_BATCH_SIZE && CAN_RxQueue_Pop(&frame) != 0U;
          processed++) {
-      /* 只在主循环里写日志；CAN 中断只负责接收并把数据放入队列。 */
+      // 只在主循环里写日志；CAN 中断只负责接收并把数据放入队列。
       CanLogger_AddFrame(&frame);
-      /* 统计处理独立于日志可写状态及界面筛选条件。 */
+      // 统计处理独立于日志可写状态及界面筛选条件。
       CanStats_AddFrame(&frame);
 
 #if CAN_RX_DEBUG_PRINT
@@ -303,7 +341,7 @@ int main(void)
 #endif
     }
 
-    /* 定期把缓冲记录同步到卡；不在 CAN 中断里调用 FatFs。 */
+    // 定期把缓冲记录同步到卡；不在 CAN 中断里调用 FatFs。
     CanLogger_Process();
   }
   /* USER CODE END 3 */
@@ -375,30 +413,30 @@ void HAL_CAN_RxFifo0MsgPendingCallback(CAN_HandleTypeDef *hcan)
         CAN_RxHeaderTypeDef header;
         uint8_t rxBytes[8] = {0};
 
-        /* 从 CAN 控制器的 FIFO0 读取一帧 */
+        // 从 CAN 控制器的 FIFO0 读取一帧
         if (HAL_CAN_GetRxMessage(
                 hcan,
                 CAN_RX_FIFO0,
                 &header,
                 rxBytes) != HAL_OK)
         {
-            /* 读取失败时结束本次回调 */
+            // 读取失败时结束本次回调
             break;
         }
 
         canRxFramesReadFromFifo++; // 成功读取一帧，计数器加 1
 
-        /* 把 HAL 收到的数据整理到项目统一的报文结构 */
+        // 把 HAL 收到的数据整理到项目统一的报文结构
         CanFrame frame = {0};
 
         frame.timestamp_us = __HAL_TIM_GET_COUNTER(&htim2); // 记录接收时间戳
         frame.ide = (uint8_t)header.IDE;
         frame.rtr = (uint8_t)header.RTR;
 
-        /* 保护 data[8]：不允许 DLC 超过经典 CAN 的 8 字节 */
+        // 保护 data[8]：不允许 DLC 超过经典 CAN 的 8 字节
         frame.dlc = (header.DLC <= 8U) ? (uint8_t)header.DLC : 8U;
 
-        /* 根据帧格式选择正确的 ID 字段 */
+        // 根据帧格式选择正确的 ID 字段
         if (header.IDE == CAN_ID_STD)
         {
             frame.id = header.StdId;
@@ -408,7 +446,7 @@ void HAL_CAN_RxFifo0MsgPendingCallback(CAN_HandleTypeDef *hcan)
             frame.id = header.ExtId;
         }
 
-        /* 复制报文数据；远程帧的 DLC 不表示这里有数据可复制 */
+        // 复制报文数据；远程帧的 DLC 不表示这里有数据可复制
         if (header.RTR == CAN_RTR_DATA)
         {
             for (uint8_t i = 0U; i < frame.dlc; i++)
@@ -417,7 +455,7 @@ void HAL_CAN_RxFifo0MsgPendingCallback(CAN_HandleTypeDef *hcan)
             }
         }
 
-        /* 入队失败表示软件队列已满，函数内部会增加溢出计数 */
+        // 入队失败表示软件队列已满，函数内部会增加溢出计数
         (void)CAN_RxQueue_PushFromISR(&frame);
     }
 }

@@ -51,7 +51,8 @@ void MX_CAN1_Init(void)
   hcan1.Init.TransmitFifoPriority = DISABLE;
   if (HAL_CAN_Init(&hcan1) != HAL_OK)
   {
-    Error_Handler();
+    // 保留 HAL 错误状态，由主循环发布至界面，避免单个外设故障终止界面任务。
+    return;
   }
   /* USER CODE BEGIN CAN1_Init 2 */
 
@@ -122,6 +123,8 @@ void HAL_CAN_MspDeInit(CAN_HandleTypeDef* canHandle)
     /* CAN1 interrupt Deinit */
     HAL_NVIC_DisableIRQ(CAN1_RX0_IRQn);
   /* USER CODE BEGIN CAN1_MspDeInit 1 */
+
+    HAL_NVIC_DisableIRQ(CAN1_SCE_IRQn);
 
   /* USER CODE END CAN1_MspDeInit 1 */
   }

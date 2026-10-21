@@ -25,12 +25,12 @@ static void simulate_can_cb(lv_timer_t *timer)
         {.id=0x7E8, .dlc=8, .data={4,65,12,26,248}},
         {.id=0x123, .rtr=2, .dlc=4}
     };
-    /* 各模拟报文的生成间隔，单位为毫秒，索引与 frames 保持一致。 */
+    // 各模拟报文的生成间隔，单位为毫秒，索引与 frames 保持一致。
     static const uint32_t intervals_ms[] = {1000,10,20,50,100,200,500,1000,500};
-    uint32_t now_us = lv_tick_get() * 1000U;  /* 转换为与固件一致的 32 位微秒时间戳。 */
+    uint32_t now_us = lv_tick_get() * 1000U;  // 转换为与固件一致的 32 位微秒时间戳。
     for(unsigned i = 0; i < sizeof(frames) / sizeof(frames[0]); i++) {
         if(now_us - frames[i].timestamp_us >= intervals_ms[i] * 1000U) {
-            /* 到期后生成一帧并更新基准时间，不补发调度延迟期间的报文。 */
+            // 到期后生成一帧并更新基准时间，不补发调度延迟期间的报文。
             frames[i].timestamp_us = now_us;
             CanStats_AddFrame(&frames[i]);
         }
@@ -41,7 +41,7 @@ int main(void)
 {
     lv_init();
 
-    /* 创建 800×480 的 Windows 窗口，对应板载 LCD 分辨率 */
+    // 创建 800×480 的 Windows 窗口，对应板载 LCD 分辨率
     lv_display_t * display = lv_windows_create_display(
         L"CanSight LVGL 9.6 Simulator",
         800,
@@ -55,17 +55,23 @@ int main(void)
         return 1;
     }
 
-    /* 使用电脑鼠标模拟触摸输入 */
+    // 使用电脑鼠标模拟触摸输入
     if(lv_windows_acquire_pointer_indev(display) == NULL) {
         return 2;
     }
 
-    /* 调用与 STM32 固件共用的界面 */
-    CanStats_Init();  /* 初始化共用统计模块。 */
+    // 调用与 STM32 固件共用的界面
+    CanStats_Init();  // 初始化共用统计模块。
+    // 模拟器不读取硬件状态；此快照仅用于预览正常运行状态的显示。
+    const CanStatsRuntime runtime = {
+        .can_state = CAN_STATS_RUNNING,
+        .sd_state = CAN_LOG_RECORDING
+    };
+    CanStats_SetRuntime(&runtime);
     ui_init();
-    lv_timer_create(simulate_can_cb, 10, NULL);  /* 注册 10 ms 周期的模拟报文调度任务。 */
+    lv_timer_create(simulate_can_cb, 10, NULL);  // 注册 10 ms 周期的模拟报文调度任务。
 
-    /* 持续运行 LVGL 定时器 */
+    // 持续运行 LVGL 定时器
     while(1) {
         uint32_t wait_ms = lv_timer_handler();
 
