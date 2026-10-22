@@ -3,6 +3,31 @@
 #include "log_player.h"
 #include "can_time.h"
 #include <string.h>
+#ifndef CAN_PLAYER_SIMULATOR
+#include "can_timestamp.h"
+#endif
+
+static UiDiagnostics ui_diagnostics;
+
+// 固件使用 TIM2 微秒时基；模拟器仅用于界面验证，诊断精度为毫秒。
+static uint32_t ui_diagnostic_time_us(void)
+{
+#ifdef CAN_PLAYER_SIMULATOR
+    return lv_tick_get() * 1000U;
+#else
+    return (uint32_t)CanTimestamp_GetUs();
+#endif
+}
+
+void ui_get_diagnostics(UiDiagnostics *diagnostics)
+{
+    if(diagnostics != NULL) {
+        *diagnostics = ui_diagnostics;
+        diagnostics->frozen = UI_DIAG_FREEZE_STATS;
+    }
+}
+
+void ui_reset_diagnostics(void) { ui_diagnostics = (UiDiagnostics){0}; }
 
 LV_FONT_DECLARE(lv_font_cansight_14);
 
@@ -22,7 +47,6 @@ static lv_obj_t *capacity_label;    // 统计表容量不足提示。
 static lv_obj_t *can_status_label;
 static lv_obj_t *sd_status_label;
 static lv_obj_t *diagnostics_label;
-static lv_obj_t *performance_label;
 static ui_archive_callback_t archive_callback;
 static lv_obj_t *archive_notice;
 static lv_obj_t *active_log_label;
@@ -56,6 +80,8 @@ typedef struct {
     lv_obj_t *table;
     lv_obj_t *matches;
     char text[11]; // 0x + 8 位十六进制数 + 字符串结束符
+    bool validity_known;
+    bool valid;
 } ui_filter_t;
 
 static ui_filter_t receive_filter;
@@ -105,6 +131,23 @@ static void set_table_cell_if_changed(lv_obj_t *table, uint32_t row,
     const char *previous = lv_table_get_cell_value(table, row, column);
     if(previous == NULL || strcmp(previous, text) != 0) {
         lv_table_set_cell_value(table, row, column, text);
+    }
+}
+
+// 相同文案不重新设置，避免匹配统计反复触发重绘。
+static void set_label_if_changed(lv_obj_t *label, const char *text)
+{
+    if(strcmp(lv_label_get_text(label), text) != 0) lv_label_set_text(label, text);
+}
+
+// 输入框仅在有效性变化时更新边框，初始化时设置一次默认样式。
+static void set_filter_validity(ui_filter_t *filter, bool valid)
+{
+    if(!filter->validity_known || filter->valid != valid) {
+        lv_obj_set_style_border_color(filter->input,
+            lv_color_hex(valid ? UI_COLOR_LINE : 0xE35B5B), LV_PART_MAIN);
+        filter->validity_known = true;
+        filter->valid = valid;
     }
 }
 
@@ -159,14 +202,15 @@ static void refresh_receive(ui_filter_t *filter)
         lv_snprintf(text, sizeof(text), "%lu", (unsigned long)entry->count);
         set_table_cell_if_changed(filter->table, row, 5, text);
     }
-    // 更新匹配条目数、当前显示范围及筛选输入状态。
-    if(!valid) lv_label_set_text(filter->matches, "ID 格式错误");
-    else lv_label_set_text_fmt(filter->matches, "匹配 %u / 共 %u  [%u-%u]",
+    // 匹配范围不随报文计数变化，不重复提交相同文案。
+    char summary[80];
+    if(!valid) lv_snprintf(summary, sizeof(summary), "ID 格式错误");
+    else lv_snprintf(summary, sizeof(summary), "匹配 %u / 共 %u  [%u-%u]",
         (unsigned)matches, (unsigned)count,
         matches ? (unsigned)receive_offset + 1U : 0U,
         (unsigned)(receive_offset + visible));
-    lv_obj_set_style_border_color(filter->input,
-        lv_color_hex(valid ? UI_COLOR_LINE : 0xE35B5B), LV_PART_MAIN);
+    set_label_if_changed(filter->matches, summary);
+    set_filter_validity(filter, valid);
 }
 
 static void refresh_filter(ui_filter_t *filter)
@@ -175,8 +219,7 @@ static void refresh_filter(ui_filter_t *filter)
         uint32_t id;
         bool all;
         bool valid = parse_filter(filter->text, &id, &all);
-        lv_obj_set_style_border_color(filter->input,
-            lv_color_hex(valid ? UI_COLOR_LINE : 0xE35B5B), LV_PART_MAIN);
+        set_filter_validity(filter, valid);
         if(valid) LogPlayer_SetFilter(id, !all);
         player_display_valid = false;
         refresh_player();
@@ -269,6 +312,7 @@ static void bind_filter(ui_filter_t *filter, lv_obj_t *input, lv_obj_t *clear,
     filter->input = input;
     filter->table = table;
     filter->matches = matches;
+    filter->validity_known = false;
     // 输入文字和占位提示是不同的绘制部分，两处都显式指定精简中文字体。
     lv_obj_set_style_text_font(input, &lv_font_cansight_14, LV_PART_MAIN);
     lv_obj_set_style_text_font(input, &lv_font_cansight_14, LV_PART_TEXTAREA_PLACEHOLDER);
@@ -731,42 +775,20 @@ static void refresh_runtime(void)
         lv_obj_set_style_text_color(sd_status_label, lv_color_hex(color), LV_PART_MAIN);
     }
 
-    // 状态更新独立于接收帧数；FIFO 事件数不能作为精确的硬件丢帧数使用。
+    // 屏幕只提示异常类别；累计计数、错误码和耗时由串口诊断提供。
     if(!runtime_display_valid || runtime->queue_lost != displayed_runtime.queue_lost ||
        runtime->fifo_overruns != displayed_runtime.fifo_overruns ||
        runtime->error_flags != displayed_runtime.error_flags ||
-       runtime->sd_error != displayed_runtime.sd_error) {
-        lv_label_set_text_fmt(diagnostics_label,
-            "Queue lost: %lu | FIFO overruns: %lu | HAL: 0x%08lX | SD: %lu (%s)",
-            (unsigned long)runtime->queue_lost, (unsigned long)runtime->fifo_overruns,
-            (unsigned long)runtime->error_flags, (unsigned long)runtime->sd_error,
-            fatfs_error_name(runtime->sd_error));
-        lv_obj_set_style_text_color(diagnostics_label, lv_color_hex(
-            runtime->queue_lost || runtime->fifo_overruns || runtime->error_flags ||
-            runtime->sd_error ? 0xE3B34E : UI_COLOR_MUTED), LV_PART_MAIN);
-    }
-    // 仅在累计诊断变化时更新控件；使用 ASCII，避免引入额外字体字符。
-    if(!runtime_display_valid || runtime->queue_peak != displayed_runtime.queue_peak ||
-       runtime->queue_capacity != displayed_runtime.queue_capacity ||
-       runtime->logger.rejected_frames != displayed_runtime.logger.rejected_frames ||
-       runtime->logger.max_write_us != displayed_runtime.logger.max_write_us ||
-       runtime->logger.max_sync_us != displayed_runtime.logger.max_sync_us ||
-       runtime->logger.max_archive_us != displayed_runtime.logger.max_archive_us) {
-        // 模拟器没有硬件接收队列，不显示未采集的硬件性能数据。
-        lv_obj_set_hidden(performance_label, runtime->queue_capacity == 0U);
-        // 显示值向上取整至毫秒，底层快照保留微秒精度。
-        uint32_t write_us = runtime->logger.max_write_us;
-        uint32_t sync_us = runtime->logger.max_sync_us;
-        uint32_t archive_us = runtime->logger.max_archive_us;
-        lv_label_set_text_fmt(performance_label,
-            "Q peak %lu/%lu | Log skip %lu\nSD max ms: W %lu S %lu A %lu",
-            (unsigned long)runtime->queue_peak, (unsigned long)runtime->queue_capacity,
-            (unsigned long)runtime->logger.rejected_frames,
-            (unsigned long)(write_us / 1000U + (write_us % 1000U != 0U)),
-            (unsigned long)(sync_us / 1000U + (sync_us % 1000U != 0U)),
-            (unsigned long)(archive_us / 1000U + (archive_us % 1000U != 0U)));
-        lv_obj_set_style_text_color(performance_label, lv_color_hex(
-            runtime->logger.rejected_frames ? 0xE3B34E : UI_COLOR_MUTED), LV_PART_MAIN);
+       runtime->sd_error != displayed_runtime.sd_error ||
+       runtime->logger.rejected_frames != displayed_runtime.logger.rejected_frames) {
+        char text[128];
+        lv_snprintf(text, sizeof(text), "%s%s%s%s",
+            runtime->queue_lost || runtime->fifo_overruns ? "接收错误  " : "",
+            runtime->error_flags ? "CAN 错误  " : "",
+            runtime->sd_error ? "SD 日志错误  " : "",
+            runtime->logger.rejected_frames ? "SD 记录错误" : "");
+        set_label_if_changed(diagnostics_label, text);
+        lv_obj_set_hidden(diagnostics_label, text[0] == '\0');
     }
     // 归档结果与接收帧数无关，未收到新报文时仍须更新。
     refresh_archive(runtime);
@@ -774,10 +796,9 @@ static void refresh_runtime(void)
     runtime_display_valid = true;
 }
 
-// 100 ms 刷新入口，先处理运行状态，再根据数据变化更新接收表格。
-static void stats_timer_cb(lv_timer_t *timer)
+// 统计刷新主体；仅修改控件，不改变 CAN 接收统计或日志记录。
+static void refresh_stats_widgets(void)
 {
-    (void)timer;
     refresh_runtime();
     refresh_player();
     uint32_t total = CanStats_GetTotalCount();
@@ -790,6 +811,17 @@ static void stats_timer_cb(lv_timer_t *timer)
     }
     // 页面切换可能已释放接收页控件，仅在控件有效时更新。
     if(receive_filter.table != NULL) refresh_receive(&receive_filter);
+}
+
+// 100 ms 定时器外层计时；冻结模式保留初始化显示，跳过后续周期控件更新。
+static void stats_timer_cb(lv_timer_t *timer)
+{
+    uint32_t started = ui_diagnostic_time_us();
+    ui_diagnostics.stats_calls++;
+    if(timer == NULL || UI_DIAG_FREEZE_STATS == 0) refresh_stats_widgets();
+    uint32_t elapsed = ui_diagnostic_time_us() - started;
+    ui_diagnostics.stats_us += elapsed;
+    if(elapsed > ui_diagnostics.max_stats_us) ui_diagnostics.max_stats_us = elapsed;
 }
 
 //创建状态栏
@@ -982,18 +1014,14 @@ void ui_init(void)
     create_status_bar(screen);
     capacity_label = create_label(screen, "", 16, 100, 770,
                                   lv_color_hex(0xE3B34E), 0);
-    diagnostics_label = create_label(screen, "", 16, 119, 770,
-                                     lv_color_hex(UI_COLOR_MUTED), 0);
-    // 利用页签右侧空白显示关键峰值，保留原有异常栏和表格空间。
-    performance_label = create_label(screen, "", 342, 56, 444,
-                                     lv_color_hex(UI_COLOR_MUTED), 0);
-    lv_obj_set_height(performance_label, 40);
+    diagnostics_label = create_label(screen, "", 342, 64, 444,
+                                     lv_color_hex(0xE3B34E), 0);
     runtime_display_valid = false;
     displayed_total = UINT32_MAX;  // 保证启动时累计帧数为 0 仍执行首次刷新。
 
-    //创建"接收"和"SD 回放"两个标签页切换按钮
+    // 创建实时接收和 SD 日志两个页面的切换按钮。
     receive_tab = create_button(screen, "接收", 12, 54, 150, 42, true);
-    playback_tab = create_button(screen, "SD 回放", 172, 54, 150, 42, false);
+    playback_tab = create_button(screen, "SD 日志", 172, 54, 150, 42, false);
     lv_obj_add_event_cb(receive_tab, tab_event_cb, LV_EVENT_CLICKED, NULL);
     lv_obj_add_event_cb(playback_tab, tab_event_cb, LV_EVENT_CLICKED, NULL);
 

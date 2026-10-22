@@ -111,6 +111,18 @@ static uint32_t canUiPeakTouchUs;
 static uint32_t canUiPeakOtherUs;
 static uint32_t canUiPeakFlushes;
 static uint32_t canUiPeakPixels;
+static uint32_t canUiPeakRefreshUs;
+static uint32_t canUiPeakRenderUs;
+static uint32_t canUiPeakRenderCpuUs;
+static uint32_t canUiPeakRefreshOtherUs;
+static uint32_t canUiPeakStatsUs;
+static uint32_t canUiPeakHandlerOtherUs;
+static uint32_t canUiPeakInvalidRequests;
+static uint32_t canUiPeakInvalidPixels;
+static uint32_t canUiCalls;
+static uint64_t canUiTotalUs;
+// 固定耗时区间，不保存逐次样本；各项互斥，均统计完整 LVGL 调用。
+static uint32_t canUiHistogram[6];
 
 /* USER CODE END PV */
 
@@ -171,7 +183,10 @@ static void CAN_PrintPerformance(void)
 {
   CanLoggerDiagnostics log;
   LvPortIndevMetrics touch;
+  UiDiagnostics widgets;
+  LvPortInvalidArea areas[LV_PORT_INVALID_AREA_LIMIT];
   CanLogger_GetDiagnostics(&log);
+  ui_get_diagnostics(&widgets);
   lv_port_indev_get_metrics(&touch);
   printf("CAN PERF: fifo=%lu processed=%lu queue_lost=%lu fifo_overruns=%lu peak=%lu/%lu\r\n",
          (unsigned long)canRxFramesReadFromFifo,
@@ -187,6 +202,27 @@ static void CAN_PrintPerformance(void)
          (unsigned long)canMaxUiUs, (unsigned long)canUiPeakLcdUs,
          (unsigned long)canUiPeakTouchUs, (unsigned long)canUiPeakOtherUs,
          (unsigned long)canUiPeakFlushes, (unsigned long)canUiPeakPixels);
+  printf("CAN UI stages us: refresh=%lu render=%lu render_cpu=%lu refresh_other=%lu stats=%lu handler_other=%lu\r\n",
+         (unsigned long)canUiPeakRefreshUs, (unsigned long)canUiPeakRenderUs,
+         (unsigned long)canUiPeakRenderCpuUs, (unsigned long)canUiPeakRefreshOtherUs,
+         (unsigned long)canUiPeakStatsUs, (unsigned long)canUiPeakHandlerOtherUs);
+  printf("CAN UI invalid: requests=%lu request_pixels=%lu (may overlap; same peak call)\r\n",
+         (unsigned long)canUiPeakInvalidRequests, (unsigned long)canUiPeakInvalidPixels);
+  printf("CAN UI stats: freeze=%lu calls=%lu max_us=%lu handler_calls=%lu handler_avg_us=%lu\r\n",
+         (unsigned long)widgets.frozen, (unsigned long)widgets.stats_calls,
+         (unsigned long)widgets.max_stats_us, (unsigned long)canUiCalls,
+         (unsigned long)(canUiCalls ? canUiTotalUs / canUiCalls : 0U));
+  printf("CAN UI hist: lt1ms=%lu 1to5ms=%lu 5to20ms=%lu 20to50ms=%lu 50to100ms=%lu ge100ms=%lu\r\n",
+         (unsigned long)canUiHistogram[0], (unsigned long)canUiHistogram[1],
+         (unsigned long)canUiHistogram[2], (unsigned long)canUiHistogram[3],
+         (unsigned long)canUiHistogram[4], (unsigned long)canUiHistogram[5]);
+  uint32_t areaCount = lv_port_disp_get_invalid_areas(areas, LV_PORT_INVALID_AREA_LIMIT);
+  for(uint32_t i = 0U; i < areaCount; i++) {
+    printf("CAN UI area: x1=%ld y1=%ld x2=%ld y2=%ld pixels=%lu hits=%lu\r\n",
+           (long)areas[i].area.x1, (long)areas[i].area.y1,
+           (long)areas[i].area.x2, (long)areas[i].area.y2,
+           (unsigned long)areas[i].pixels, (unsigned long)areas[i].hits);
+  }
   printf("CAN TOUCH: callbacks=%lu max_us=%lu io_errors=%lu\r\n",
          (unsigned long)touch.callbacks, (unsigned long)touch.max_read_us,
          (unsigned long)touch.io_errors);
@@ -331,6 +367,10 @@ int main(void)
   CAN_PublishRuntime();
   lv_timer_handler();
   lv_refr_now(NULL);
+  lv_port_disp_reset_metrics();
+  ui_reset_diagnostics();
+  printf("CAN UI experiment: freeze_stats=%u; widget period=100ms\r\n",
+         (unsigned)UI_DIAG_FREEZE_STATS);
 
 
   // CAN1过滤器配置，ID和Mask都设为0，表示接收所有符合格式的报文。
@@ -440,13 +480,22 @@ int main(void)
       CAN_PublishRuntime();
       LvPortDispMetrics displayBefore, displayAfter;
       LvPortIndevMetrics touchBefore, touchAfter;
+      UiDiagnostics statsBefore, statsAfter;
       lv_port_disp_get_metrics(&displayBefore);
+      ui_get_diagnostics(&statsBefore);
       lv_port_indev_get_metrics(&touchBefore);
       uint32_t started = (uint32_t)CanTimestamp_GetUs();
       lv_timer_handler();
       elapsed = (uint32_t)CanTimestamp_GetUs() - started;
       lv_port_disp_get_metrics(&displayAfter);
       lv_port_indev_get_metrics(&touchAfter);
+      ui_get_diagnostics(&statsAfter);
+      canUiCalls++;
+      canUiTotalUs += elapsed;
+      uint32_t bucket = elapsed < 1000U ? 0U : elapsed < 5000U ? 1U :
+                        elapsed < 20000U ? 2U : elapsed < 50000U ? 3U :
+                        elapsed < 100000U ? 4U : 5U;
+      canUiHistogram[bucket]++;
       if(elapsed > canMaxUiUs) {
         canMaxUiUs = elapsed;
         canUiPeakLcdUs = displayAfter.flush_us - displayBefore.flush_us;
@@ -455,6 +504,16 @@ int main(void)
         canUiPeakOtherUs = elapsed > measured ? elapsed - measured : 0U;
         canUiPeakFlushes = displayAfter.flush_calls - displayBefore.flush_calls;
         canUiPeakPixels = displayAfter.pixels - displayBefore.pixels;
+        canUiPeakRefreshUs = displayAfter.refresh_us - displayBefore.refresh_us;
+        canUiPeakRenderUs = displayAfter.render_us - displayBefore.render_us;
+        canUiPeakRenderCpuUs = displayAfter.render_cpu_us - displayBefore.render_cpu_us;
+        canUiPeakRefreshOtherUs = canUiPeakRefreshUs > canUiPeakRenderUs ?
+                                 canUiPeakRefreshUs - canUiPeakRenderUs : 0U;
+        canUiPeakStatsUs = statsAfter.stats_us - statsBefore.stats_us;
+        measured = canUiPeakRefreshUs + canUiPeakTouchUs + canUiPeakStatsUs;
+        canUiPeakHandlerOtherUs = elapsed > measured ? elapsed - measured : 0U;
+        canUiPeakInvalidRequests = displayAfter.invalid_requests - displayBefore.invalid_requests;
+        canUiPeakInvalidPixels = displayAfter.invalid_pixels - displayBefore.invalid_pixels;
       }
       lastUiTick = HAL_GetTick();
     }
