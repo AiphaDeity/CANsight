@@ -55,6 +55,15 @@ if(CANSIGHT_LVGL_DEBUG_O2)
 endif()
 message(STATUS "LVGL Debug -O2: ${CANSIGHT_LVGL_DEBUG_O2}")
 
+# 仅在固件 Debug 中启用单函数优化，避免改变 LCD 初始化及其他驱动代码。
+option(CANSIGHT_LCD_FILL_DEBUG_O2 "Use -O2 for LCD_Color_Fill in firmware Debug builds" ON)
+if(CANSIGHT_LCD_FILL_DEBUG_O2)
+    target_compile_definitions(${CMAKE_PROJECT_NAME} PRIVATE
+        "$<$<AND:$<CONFIG:Debug>,$<COMPILE_LANG_AND_ID:C,GNU>>:CANSIGHT_LCD_FILL_O2=1>"
+    )
+endif()
+message(STATUS "LCD fill Debug -O2: ${CANSIGHT_LCD_FILL_DEBUG_O2}")
+
 # Link directories setup
 target_link_directories(${CMAKE_PROJECT_NAME} PRIVATE
     # Add user defined library search paths

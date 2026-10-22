@@ -976,6 +976,10 @@ void LCD_Fill(uint16_t sx, uint16_t sy, uint16_t ex, uint16_t ey, uint16_t color
 // 在指定区域内填充指定颜色块
 //(sx,sy),(ex,ey):填充矩形对角坐标,区域大小为:(ex-sx+1)*(ey-sy+1)
 // color:要填充的颜色
+// GCC 单函数优化由固件 Debug 开关控制，像素端口仍按 volatile 顺序写入。
+#if defined(CANSIGHT_LCD_FILL_O2) && CANSIGHT_LCD_FILL_O2 && defined(__GNUC__)
+__attribute__((optimize("O2")))
+#endif
 void LCD_Color_Fill(uint16_t sx, uint16_t sy, uint16_t ex, uint16_t ey, uint16_t *color)
 {
 	if(color == NULL || ex < sx || ey < sy) return;
