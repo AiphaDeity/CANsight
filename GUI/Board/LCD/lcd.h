@@ -32,7 +32,8 @@ typedef struct
 //使用NOR/SRAM的 Bank1.sector4,地址位HADDR[27,26]=11 A0作为数据命令区分线
 //注意设置时STM32内部会右移一位对其! 111 1110=0X7E
 #define LCD_BASE ((uint32_t)(0x6C000000))
-#define LCD ((LCD_TypeDef *)LCD_BASE)
+// FSMC 映射寄存器按 volatile 访问，防止编译器省略或合并硬件读写。
+#define LCD ((volatile LCD_TypeDef *)LCD_BASE)
 
 
 //扫描方式

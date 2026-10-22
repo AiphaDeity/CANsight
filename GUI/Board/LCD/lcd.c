@@ -16,16 +16,12 @@ _lcd_dev lcddev;
 // regval:寄存器值
 void LCD_WR_REG(uint16_t regval)
 {
-	volatile int i = 0;
-	regval = regval;			 // 使用-O2优化的时候,必须插入的延时
 	LCD->LCD_REG = regval; // 写入要写的寄存器序号
 }
 // 写LCD数据
 // data:要写入的值
 void LCD_WR_DATA(uint16_t data)
 {
-	volatile int i = 0;
-	data = data; // 使用-O2优化的时候,必须插入的延时
 	LCD->LCD_RAM = data;
 }
 
@@ -94,11 +90,11 @@ uint16_t LCD_ReadPoint(uint16_t x, uint16_t y)
 	if (x >= lcddev.width || y >= lcddev.height)
 		return 0; // 超过了范围,直接返回
 	LCD_SetCursor(x, y, x, y);
-	r = LCD_RD_DATA();		// dummy Read
+	(void)LCD_RD_DATA();  // 保留首次空读，丢弃其结果。
 	opt_delay(2);
-	r = LCD_RD_DATA();			 // 实际坐标颜色
+	r = LCD_RD_DATA();  // 返回第二次读取的数据，不再固定返回 0。
 
-	return 0;
+	return r;
 }
 // LCD开启显示
 void LCD_DisplayOn(void)
@@ -982,16 +978,14 @@ void LCD_Fill(uint16_t sx, uint16_t sy, uint16_t ex, uint16_t ey, uint16_t color
 // color:要填充的颜色
 void LCD_Color_Fill(uint16_t sx, uint16_t sy, uint16_t ex, uint16_t ey, uint16_t *color)
 {
-	uint16_t height, width;
-	uint16_t i, j;
-	width = ex - sx + 1;	// 得到填充的宽度
-	height = ey - sy + 1; // 高度
-	for (i = 0; i < height; i++)
-	{
-		LCD_SetCursor(sx, sy + i,ex, ey); // 设置光标位置
-		LCD_WriteRAM_Prepare();		 // 开始写入GRAM
-		for (j = 0; j < width; j++)
-			LCD->LCD_RAM = color[i * width + j]; // 写入数据
+	if(color == NULL || ex < sx || ey < sy) return;
+	uint32_t count = (uint32_t)(ex - sx + 1U) * (uint32_t)(ey - sy + 1U);
+	// 窗口内按现有扫描方向自动递增，一块像素数据仅设置一次窗口。
+	LCD_SetCursor(sx, sy, ex, ey);
+	LCD_WriteRAM_Prepare();
+	volatile uint16_t *ram = &LCD->LCD_RAM;
+	while(count-- != 0U) {
+		*ram = *color++;
 	}
 }
 // 画线

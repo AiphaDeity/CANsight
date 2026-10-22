@@ -50,7 +50,6 @@
 static volatile DSTATUS Stat = STA_NOINIT;
 
 /* Private function prototypes -----------------------------------------------*/
-static DSTATUS SD_CheckStatus(BYTE lun);
 DSTATUS SD_initialize (BYTE);
 DSTATUS SD_status (BYTE);
 DRESULT SD_read (BYTE, BYTE*, DWORD, UINT);
@@ -179,20 +178,6 @@ static DRESULT SD_TransferDMA(uint8_t writing, DWORD sector, UINT blocks)
 
 /* Private functions ---------------------------------------------------------*/
 
-static DSTATUS SD_CheckStatus(BYTE lun)
-{
-  Stat = STA_NOINIT;
-  // 已发生传输故障时禁止后续历史访问隐式恢复，须经 SD_initialize 重新初始化。
-  if(firstFault.valid != 0U) return Stat;
-
-  if(BSP_SD_GetCardState() == MSD_OK)
-  {
-    Stat &= ~STA_NOINIT;
-  }
-
-  return Stat;
-}
-
 /**
   * @brief  Initializes a Drive
   * @param  lun : not used
@@ -200,20 +185,22 @@ static DSTATUS SD_CheckStatus(BYTE lun)
   */
 DSTATUS SD_initialize(BYTE lun)
 {
+  (void)lun;
   firstFault.valid = 0U;
   Stat = STA_NOINIT;
 
 #if !defined(DISABLE_SD_INIT)
-
-  if(BSP_SD_Init() == MSD_OK)
-  {
-    Stat = SD_CheckStatus(lun);
+  uint32_t started = HAL_GetTick();
+  if(BSP_SD_Init() != MSD_OK) {
+    SD_RecordFault("initialize", 0U, 0U, RES_NOTRDY, started);
+    return Stat;
   }
-
-#else
-  Stat = SD_CheckStatus(lun);
 #endif
 
+  // 仅在初始化成功且卡已就绪后清除 NOINIT；普通状态读取不得重置该标志。
+  if(SD_WaitReady("init-ready", 0U, 0U) == RES_OK) {
+    Stat &= (DSTATUS)~STA_NOINIT;
+  }
   return Stat;
 }
 
@@ -224,7 +211,10 @@ DSTATUS SD_initialize(BYTE lun)
   */
 DSTATUS SD_status(BYTE lun)
 {
-  return SD_CheckStatus(lun);
+  (void)lun;
+  // FatFs 在文件和目录校验时调用本函数，NOINIT 代表初始化状态而非瞬时忙碌。
+  // 不在此处发送 CMD13；实际块传输、CTRL_SYNC 的有界等待负责检测并锁存故障。
+  return Stat;
 }
 
 /* USER CODE BEGIN beforeReadSection */

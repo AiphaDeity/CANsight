@@ -56,6 +56,8 @@
 #define CAN_UI_INTERVAL_MS 5U
 #define CAN_HISTORY_INTERVAL_MS 5U
 #define CAN_HISTORY_QUEUE_LIMIT 128U
+// 接收停止且队列排空后输出一次摘要，避免发送期间的周期串口阻塞。
+#define CAN_DIAGNOSTIC_IDLE_MS 1500U
 #if (CAN_RX_QUEUE_SIZE < 2U) || ((CAN_RX_QUEUE_SIZE & (CAN_RX_QUEUE_SIZE - 1U)) != 0U)
 #error "CAN_RX_QUEUE_SIZE must be a power of two and at least two"
 #endif
@@ -103,6 +105,12 @@ static uint32_t canMaxServiceGapUs;
 static uint32_t canMaxBatchUs;
 static uint32_t canMaxUiUs;
 static uint32_t canMaxHistoryUs;
+// 保存同一次最慢 LVGL 调用内的分项耗时，避免将不同调用的峰值相加。
+static uint32_t canUiPeakLcdUs;
+static uint32_t canUiPeakTouchUs;
+static uint32_t canUiPeakOtherUs;
+static uint32_t canUiPeakFlushes;
+static uint32_t canUiPeakPixels;
 
 /* USER CODE END PV */
 
@@ -156,6 +164,36 @@ static void CAN_PublishRuntime(void)
   snprintf(runtime.archive_name, sizeof(runtime.archive_name), "%s",
            CanLogger_GetLastArchiveName());
   CanStats_SetRuntime(&runtime);
+}
+
+// 仅由主循环在接收静默后调用，所有耗时峰值均取打印之前的快照。
+static void CAN_PrintPerformance(void)
+{
+  CanLoggerDiagnostics log;
+  LvPortIndevMetrics touch;
+  CanLogger_GetDiagnostics(&log);
+  lv_port_indev_get_metrics(&touch);
+  printf("CAN PERF: fifo=%lu processed=%lu queue_lost=%lu fifo_overruns=%lu peak=%lu/%lu\r\n",
+         (unsigned long)canRxFramesReadFromFifo,
+         (unsigned long)CanStats_GetTotalCount(), (unsigned long)canRxQueueOverflow,
+         (unsigned long)canRxFifo0OverrunEvents, (unsigned long)canRxQueuePeak,
+         (unsigned long)(CAN_RX_QUEUE_SIZE - 1U));
+  printf("CAN PERF us: gap=%lu batch=%lu ui=%lu history=%lu write=%lu sync=%lu archive=%lu\r\n",
+         (unsigned long)canMaxServiceGapUs, (unsigned long)canMaxBatchUs,
+         (unsigned long)canMaxUiUs, (unsigned long)canMaxHistoryUs,
+         (unsigned long)log.max_write_us, (unsigned long)log.max_sync_us,
+         (unsigned long)log.max_archive_us);
+  printf("CAN UI peak: total_us=%lu lcd_us=%lu touch_us=%lu other_us=%lu flushes=%lu pixels=%lu\r\n",
+         (unsigned long)canMaxUiUs, (unsigned long)canUiPeakLcdUs,
+         (unsigned long)canUiPeakTouchUs, (unsigned long)canUiPeakOtherUs,
+         (unsigned long)canUiPeakFlushes, (unsigned long)canUiPeakPixels);
+  printf("CAN TOUCH: callbacks=%lu max_us=%lu io_errors=%lu\r\n",
+         (unsigned long)touch.callbacks, (unsigned long)touch.max_read_us,
+         (unsigned long)touch.io_errors);
+  printf("CAN LOG: accepted=%lu written=%lu synced=%lu buffered=%lu rejected=%lu\r\n",
+         (unsigned long)log.accepted_frames, (unsigned long)log.written_frames,
+         (unsigned long)log.synced_frames, (unsigned long)log.buffered_frames,
+         (unsigned long)log.rejected_frames);
 }
 
 // 界面回调仅提交请求，不在 LVGL 事件中直接访问文件系统。
@@ -289,6 +327,11 @@ int main(void)
   }
   LogPlayer_Init(SDPath);
 
+  // CAN 尚未启动时完成初始整屏绘制，避免首次全屏渲染占用接收处理窗口。
+  CAN_PublishRuntime();
+  lv_timer_handler();
+  lv_refr_now(NULL);
+
 
   // CAN1过滤器配置，ID和Mask都设为0，表示接收所有符合格式的报文。
   CAN_FilterTypeDef canFilter = {0};
@@ -336,6 +379,9 @@ int main(void)
   uint32_t lastServiceUs = (uint32_t)CanTimestamp_GetUs();
   uint32_t lastUiTick = HAL_GetTick() - CAN_UI_INTERVAL_MS;
   uint32_t lastHistoryTick = HAL_GetTick() - CAN_HISTORY_INTERVAL_MS;
+  uint32_t observedFifoCount = 0U;
+  uint32_t lastReceiveTick = HAL_GetTick();
+  uint8_t performancePending = 0U;
 
   /* USER CODE END 2 */
 
@@ -392,10 +438,24 @@ int main(void)
     // 界面按时间调度，持续来帧时仍保留输入及状态刷新的执行机会。
     if(HAL_GetTick() - lastUiTick >= CAN_UI_INTERVAL_MS) {
       CAN_PublishRuntime();
+      LvPortDispMetrics displayBefore, displayAfter;
+      LvPortIndevMetrics touchBefore, touchAfter;
+      lv_port_disp_get_metrics(&displayBefore);
+      lv_port_indev_get_metrics(&touchBefore);
       uint32_t started = (uint32_t)CanTimestamp_GetUs();
       lv_timer_handler();
       elapsed = (uint32_t)CanTimestamp_GetUs() - started;
-      if(elapsed > canMaxUiUs) canMaxUiUs = elapsed;
+      lv_port_disp_get_metrics(&displayAfter);
+      lv_port_indev_get_metrics(&touchAfter);
+      if(elapsed > canMaxUiUs) {
+        canMaxUiUs = elapsed;
+        canUiPeakLcdUs = displayAfter.flush_us - displayBefore.flush_us;
+        canUiPeakTouchUs = touchAfter.read_us - touchBefore.read_us;
+        uint32_t measured = canUiPeakLcdUs + canUiPeakTouchUs;
+        canUiPeakOtherUs = elapsed > measured ? elapsed - measured : 0U;
+        canUiPeakFlushes = displayAfter.flush_calls - displayBefore.flush_calls;
+        canUiPeakPixels = displayAfter.pixels - displayBefore.pixels;
+      }
       lastUiTick = HAL_GetTick();
     }
 
@@ -408,6 +468,21 @@ int main(void)
       elapsed = (uint32_t)CanTimestamp_GetUs() - started;
       if(elapsed > canMaxHistoryUs) canMaxHistoryUs = elapsed;
       lastHistoryTick = HAL_GetTick();
+    }
+
+    // 仅在接收已静默且队列排空后打印一次；再次来帧后重新等待静默。
+    uint32_t fifoCount = canRxFramesReadFromFifo;
+    if(fifoCount != observedFifoCount) {
+      observedFifoCount = fifoCount;
+      lastReceiveTick = HAL_GetTick();
+      performancePending = 1U;
+    }
+    else if(performancePending && canRxQueueHead == canRxQueueTail &&
+            HAL_GetTick() - lastReceiveTick >= CAN_DIAGNOSTIC_IDLE_MS) {
+      performancePending = 0U;
+      CAN_PrintPerformance();
+      // 静默期间的串口输出不计为下一轮接收处理停顿。
+      lastServiceUs = (uint32_t)CanTimestamp_GetUs();
     }
 
     // 仅在没有接收积压时短暂让出 CPU；有积压立即进入下一批处理。

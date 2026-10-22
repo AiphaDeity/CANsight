@@ -38,7 +38,7 @@ extern const Diskio_drvTypeDef  SD_Driver;
 // 保留首次块传输或卡就绪等待失败现场，后续文件访问不得覆盖首因。
 // hal_error 使用 HAL_SD_ERROR_* 位；sdio_status 是 HAL 返回后的寄存器快照。
 typedef struct {
-  const char *operation;     // read-dma、write-dma、read-ready、write-ready 或 sync-ready。
+  const char *operation;     // 初始化、DMA 传输或卡就绪等待的失败阶段名称。
   uint32_t sector;           // 失败请求的起始逻辑扇区；独立同步时为 0。
   uint32_t blocks;           // 请求扇区数；独立同步时为 0。
   uint32_t disk_result;      // 本层返回的 RES_ERROR 或 RES_NOTRDY。

@@ -64,6 +64,14 @@ static void CanLogger_StopWithError(const char *stage, FRESULT result)
              (unsigned)((fault->hal_error & HAL_SD_ERROR_DATA_TIMEOUT) != 0U),
              (unsigned)((fault->hal_error & HAL_SD_ERROR_CMD_RSP_TIMEOUT) != 0U));
     }
+    if(result == FR_INVALID_OBJECT) {
+      // 比较已知对象字段，不解引用可能损坏的 logFile.obj.fs 指针。
+      // 磁盘状态查询仅读取驱动缓存，不在错误报告中再次访问 SD 卡。
+      printf("SD OBJ: fs_match=%u file_id=%u volume_id=%u fs_type=%u disk_status=0x%02X\r\n",
+             (unsigned)(logFile.obj.fs == &SDFatFS), (unsigned)logFile.obj.id,
+             (unsigned)SDFatFS.id, (unsigned)SDFatFS.fs_type,
+             (unsigned)SD_Driver.disk_status(0U));
+    }
     logErrorReported = 1U;  // 首故障不会被后续历史读取或容量查询错误替代。
   }
 }
@@ -466,10 +474,10 @@ void CanLogger_Process(void)
 
     lastSyncTick = HAL_GetTick();  //记录当前时间戳
 
-    // 首批报文完成写入并同步后提示一次，便于不拔卡确认日志工作。
+    // 每个活动文件首次周期同步成功后提示一次，输出当时该文件累计接纳数。
     if ((loggedFrameCount > 0U) && (firstWriteSyncReported == 0U))
     {
-      printf("SD LOG: first CAN batch synced, frames=%lu\r\n",
+      printf("SD LOG: first periodic sync OK, file_frames=%lu\r\n",
              (unsigned long)loggedFrameCount);
       firstWriteSyncReported = 1U;  //标记已报告
     }

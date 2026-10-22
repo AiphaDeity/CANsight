@@ -1,6 +1,7 @@
 #include "lv_port_disp.h"
 #include "lcd.h"
 #include "main.h"
+#include "can_timestamp.h"
 #include <stdint.h>
 
 #define LCD_HOR_RES 800
@@ -10,6 +11,12 @@
 // 静态分配缓冲区
 static uint16_t draw_buffer[LCD_BUF_SIZE];
 static lv_display_t *lcd_display;
+static LvPortDispMetrics display_metrics;
+
+void lv_port_disp_get_metrics(LvPortDispMetrics *metrics)
+{
+    if(metrics != NULL) *metrics = display_metrics;
+}
 
 // LVGL 通过这个函数获取毫秒计时
 static uint32_t lv_port_get_tick(void)
@@ -20,9 +27,13 @@ static uint32_t lv_port_get_tick(void)
 //LVGL要求刷新的区域坐标右下角也包含在区域内
 static void lcd_flush_cb(lv_display_t *display, const lv_area_t *area, uint8_t *pixel_map)
 {
-    // 填充
+    uint32_t started = (uint32_t)CanTimestamp_GetUs();
     LCD_Color_Fill((uint16_t)area->x1, (uint16_t)area->y1, (uint16_t)area->x2, (uint16_t)area->y2, (uint16_t *)pixel_map);
-    // 通知LVGL绘制完成
+    display_metrics.flush_us += (uint32_t)CanTimestamp_GetUs() - started;
+    display_metrics.flush_calls++;
+    display_metrics.pixels += (uint32_t)(area->x2 - area->x1 + 1) *
+                             (uint32_t)(area->y2 - area->y1 + 1);
+    // 仅统计 LCD 传输，软件渲染和布局耗时由主循环作差区分。
     lv_display_flush_ready(display);
 }
 
