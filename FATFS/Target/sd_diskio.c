@@ -17,7 +17,8 @@
   */
 /* USER CODE END Header */
 
-// CubeMX 最初生成轮询模板；本文件现以 DMA 完成块传输，并同步等待完成及卡就绪。
+/* Note: code generation based on sd_diskio_template_bspv1.c v2.1.4
+   as "Use dma template" is disabled. */
 
 /* USER CODE BEGIN firstSection */
 // 软件超时单位为毫秒，不使用值为 0xFFFFFFFF 的硬件数据超时常量。
@@ -29,10 +30,18 @@
 /* Includes ------------------------------------------------------------------*/
 #include "ff_gen_drv.h"
 #include "sd_diskio.h"
-#include <string.h>
 
 /* Private typedef -----------------------------------------------------------*/
 /* Private define ------------------------------------------------------------*/
+/* use the default SD timout as defined in the platform BSP driver*/
+#if defined(SDMMC_DATATIMEOUT)
+#define SD_TIMEOUT SDMMC_DATATIMEOUT
+#elif defined(SD_DATATIMEOUT)
+#define SD_TIMEOUT SD_DATATIMEOUT
+#else
+#define SD_TIMEOUT 30 * 1000
+#endif
+
 #define SD_DEFAULT_BLOCK_SIZE 512
 
 /*
@@ -50,6 +59,7 @@
 static volatile DSTATUS Stat = STA_NOINIT;
 
 /* Private function prototypes -----------------------------------------------*/
+static DSTATUS SD_CheckStatus(BYTE lun);
 DSTATUS SD_initialize (BYTE);
 DSTATUS SD_status (BYTE);
 DRESULT SD_read (BYTE, BYTE*, DWORD, UINT);
@@ -178,6 +188,18 @@ static DRESULT SD_TransferDMA(uint8_t writing, DWORD sector, UINT blocks)
 
 /* Private functions ---------------------------------------------------------*/
 
+static DSTATUS SD_CheckStatus(BYTE lun)
+{
+  Stat = STA_NOINIT;
+
+  if(BSP_SD_GetCardState() == MSD_OK)
+  {
+    Stat &= ~STA_NOINIT;
+  }
+
+  return Stat;
+}
+
 /**
   * @brief  Initializes a Drive
   * @param  lun : not used
@@ -185,22 +207,19 @@ static DRESULT SD_TransferDMA(uint8_t writing, DWORD sector, UINT blocks)
   */
 DSTATUS SD_initialize(BYTE lun)
 {
-  (void)lun;
-  firstFault.valid = 0U;
-  Stat = STA_NOINIT;
+Stat = STA_NOINIT;
 
 #if !defined(DISABLE_SD_INIT)
-  uint32_t started = HAL_GetTick();
-  if(BSP_SD_Init() != MSD_OK) {
-    SD_RecordFault("initialize", 0U, 0U, RES_NOTRDY, started);
-    return Stat;
+
+  if(BSP_SD_Init() == MSD_OK)
+  {
+    Stat = SD_CheckStatus(lun);
   }
+
+#else
+  Stat = SD_CheckStatus(lun);
 #endif
 
-  // 仅在初始化成功且卡已就绪后清除 NOINIT；普通状态读取不得重置该标志。
-  if(SD_WaitReady("init-ready", 0U, 0U) == RES_OK) {
-    Stat &= (DSTATUS)~STA_NOINIT;
-  }
   return Stat;
 }
 
@@ -211,10 +230,7 @@ DSTATUS SD_initialize(BYTE lun)
   */
 DSTATUS SD_status(BYTE lun)
 {
-  (void)lun;
-  // FatFs 在文件和目录校验时调用本函数，NOINIT 代表初始化状态而非瞬时忙碌。
-  // 不在此处发送 CMD13；实际块传输、CTRL_SYNC 的有界等待负责检测并锁存故障。
-  return Stat;
+  return SD_CheckStatus(lun);
 }
 
 /* USER CODE BEGIN beforeReadSection */
@@ -231,19 +247,20 @@ DSTATUS SD_status(BYTE lun)
 
 DRESULT SD_read(BYTE lun, BYTE *buff, DWORD sector, UINT count)
 {
-  (void)lun;
-  if(buff == NULL || count == 0U) return RES_PARERR;
-  if(Stat & STA_NOINIT) return RES_NOTRDY;
-  while(count != 0U) {
-    UINT blocks = count > SD_DMA_BLOCKS ? SD_DMA_BLOCKS : count;
-    DRESULT result = SD_TransferDMA(0U, sector, blocks);
-    if(result != RES_OK) return result;
-    memcpy(buff, dmaBuffer, blocks * SD_DEFAULT_BLOCK_SIZE);
-    buff += blocks * SD_DEFAULT_BLOCK_SIZE;
-    sector += blocks;
-    count -= blocks;
+  DRESULT res = RES_ERROR;
+
+  if(BSP_SD_ReadBlocks((uint32_t*)buff,
+                       (uint32_t) (sector),
+                       count, SD_TIMEOUT) == MSD_OK)
+  {
+    /* wait until the read operation is finished */
+    while(BSP_SD_GetCardState()!= MSD_OK)
+    {
+    }
+    res = RES_OK;
   }
-  return RES_OK;
+
+  return res;
 }
 
 /* USER CODE BEGIN beforeWriteSection */
@@ -261,19 +278,20 @@ DRESULT SD_read(BYTE lun, BYTE *buff, DWORD sector, UINT count)
 
 DRESULT SD_write(BYTE lun, const BYTE *buff, DWORD sector, UINT count)
 {
-  (void)lun;
-  if(buff == NULL || count == 0U) return RES_PARERR;
-  if(Stat & STA_NOINIT) return RES_NOTRDY;
-  while(count != 0U) {
-    UINT blocks = count > SD_DMA_BLOCKS ? SD_DMA_BLOCKS : count;
-    memcpy(dmaBuffer, buff, blocks * SD_DEFAULT_BLOCK_SIZE);
-    DRESULT result = SD_TransferDMA(1U, sector, blocks);
-    if(result != RES_OK) return result;
-    buff += blocks * SD_DEFAULT_BLOCK_SIZE;
-    sector += blocks;
-    count -= blocks;
+  DRESULT res = RES_ERROR;
+
+  if(BSP_SD_WriteBlocks((uint32_t*)buff,
+                        (uint32_t)(sector),
+                        count, SD_TIMEOUT) == MSD_OK)
+  {
+	/* wait until the Write operation is finished */
+    while(BSP_SD_GetCardState() != MSD_OK)
+    {
+    }
+    res = RES_OK;
   }
-  return RES_OK;
+
+  return res;
 }
 #endif /* _USE_WRITE == 1 */
 
@@ -299,7 +317,7 @@ DRESULT SD_ioctl(BYTE lun, BYTE cmd, void *buff)
   {
   /* Make sure that no pending write process */
   case CTRL_SYNC :
-    res = SD_WaitReady("sync-ready", 0U, 0U);
+    res = RES_OK;
     break;
 
   /* Get number of sectors on the disk (DWORD) */
