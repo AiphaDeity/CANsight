@@ -36,6 +36,19 @@ add_executable(${CMAKE_PROJECT_NAME})
 
 # Add STM32CubeMX generated sources
 add_subdirectory(cmake/stm32cubemx)
+
+# CubeMX 会重写默认 SD 驱动；从生成的源列表移除模板，由工程自有 DMA 实现接管。
+get_target_property(cansight_application_sources ${CMAKE_PROJECT_NAME} SOURCES)
+list(LENGTH cansight_application_sources cansight_sources_before_sd_filter)
+list(FILTER cansight_application_sources EXCLUDE REGEX "/FATFS/Target/sd_diskio[.]c$")
+list(LENGTH cansight_application_sources cansight_sources_after_sd_filter)
+math(EXPR cansight_sd_template_count
+    "${cansight_sources_before_sd_filter} - ${cansight_sources_after_sd_filter}")
+if(NOT cansight_sd_template_count EQUAL 1)
+    message(FATAL_ERROR "Expected one generated sd_diskio.c; review the SD DMA driver source selection")
+endif()
+set_property(TARGET ${CMAKE_PROJECT_NAME} PROPERTY SOURCES "${cansight_application_sources}")
+message(STATUS "SD disk driver: custom DMA (Core/Src/sd_diskio_dma.c)")
 set(LV_BUILD_CONF_PATH
     "${CMAKE_CURRENT_SOURCE_DIR}/Middlewares/Third_Party/lv_conf.h"
     CACHE PATH "LVGL configuration file" FORCE)
@@ -73,6 +86,7 @@ target_link_directories(${CMAKE_PROJECT_NAME} PRIVATE
 target_sources(${CMAKE_PROJECT_NAME} PRIVATE
     # Add user sources here
     ${CMAKE_CURRENT_SOURCE_DIR}/Core/Src/can_logger.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/Core/Src/sd_diskio_dma.c
     ${CMAKE_CURRENT_SOURCE_DIR}/Core/Src/can_stats.c
     ${CMAKE_CURRENT_SOURCE_DIR}/Core/Src/can_timestamp.c
     ${CMAKE_CURRENT_SOURCE_DIR}/Core/Src/log_player.c

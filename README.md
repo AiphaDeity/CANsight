@@ -30,7 +30,7 @@ CanSight 是基于 STM32F407 和 LVGL 的经典 CAN 总线查看与日志记录�
 | 内存 | 1 MB Flash、128 KB SRAM、64 KB CCMRAM |
 | 显示 | 800 × 480 LCD，FSMC 接口，RGB565 |
 | 触摸 | GT911，I²C 接口 |
-| CAN | CAN1，500 kbit/s，Normal 模式 |
+| CAN | CAN1，1 Mbit/s，Normal 模式；位速率切换后的实机验证待完成 |
 | SD 卡 | SDIO 接口，FatFs 文件系统 |
 | 时间戳 | TIM2，1 MHz 计数，溢出中断扩展为 64 位微秒时间戳 |
 | 调试串口 | USART6，115200 bit/s，8N1 |
@@ -326,7 +326,11 @@ SD 底层每次 DMA 块传输的软件等待上限设为 1000 ms，随后等待�
 
 此次状态语义修正尚未编译或上板验证。先保持同一发送负载，分别确认只停留接收页、反复切页、进入历史预览及手动归档时的状态。SD 同步错误和软件队列溢出是不同问题，错误消失也不能代替收发数量及 CSV 完整性核对。
 
-`main.c` 的用户逻辑位于 CubeMX 的 USER CODE 区域。`FATFS/Target/sd_diskio.c` 的块读写及 `CTRL_SYNC` 修改包含生成区域，后续重新生成工程时须核对并保留这些改动。
+`main.c` 的用户逻辑位于 CubeMX 的 USER CODE 区域。自定义 SD 驱动已从生成文件移至 `Core/Src/sd_diskio_dma.c`，保留 DMA 中转缓冲、块读写、有界等待、首故障现场以及缓存初始化状态的逻辑，并继续导出 FatFs 使用的 `SD_Driver`。根 `CMakeLists.txt` 在加入 CubeMX 子目录后，从应用源列表排除 `FATFS/Target/sd_diskio.c`，再加入自定义驱动；未找到恰好一个模板源时配置直接报错，避免无意编译默认轮询实现或重复链接。
+
+`FATFS/Target/sd_diskio.c` 留作生成模板，不参与固件构建；`sd_diskio.h` 中的诊断类型和接口声明位于 USER CODE 区域。不要把自定义实现复制回生成区域，也不要通过修改 `cmake/stm32cubemx/CMakeLists.txt` 接入，因为该文件同样会被生成。后续生成应启用保留用户代码，并检查根构建配置仍采用自定义源；配置输出应包含 `SD disk driver: custom DMA (Core/Src/sd_diskio_dma.c)`，编译命令清单应包含自定义驱动而不包含默认 `sd_diskio.c`。
+
+当前保留 CAN1 的 1 Mbit/s 配置（42 MHz、Prescaler 3、BS1 11、BS2 2、SJW 1），顶部速率文字同步改为 `1 Mbit/s`。已对比 `dde9b1a`：TIM2 用户区的时间戳溢出处理仍在，`_FS_LOCK=4` 和 4 KiB 最小栈保持有效。移除了一处生成后重复的 TIM2 句柄声明。驱动迁移尚未编译、上板或重新运行 CubeMX 验证；先重新配置、构建，再以 PCAN 1 Mbit/s、三条标准 8 字节报文各 1 ms 复测接收与记录。还需一次实际重新生成后的差异检查和复测，才能确认生成保护流程有效。
 
 ### 日志归档规则
 

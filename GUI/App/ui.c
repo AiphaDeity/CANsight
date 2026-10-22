@@ -840,7 +840,7 @@ static void create_status_bar(lv_obj_t *screen)
     create_label(bar, "CanSight", 16, 12, 100, lv_color_hex(UI_COLOR_TEXT), 18);
     can_status_label = create_label(bar, "● CAN1 未启动", 150, 13, 150,
                                    lv_color_hex(UI_COLOR_MUTED), 0);
-    create_label(bar, "500 kbit/s", 325, 13, 110, lv_color_hex(UI_COLOR_TEXT), 0);
+    create_label(bar, "1 Mbit/s", 325, 13, 110, lv_color_hex(UI_COLOR_TEXT), 0);
     sd_status_label = create_label(bar, "● SD 未挂载", 475, 13, 150,
                                   lv_color_hex(UI_COLOR_MUTED), 0);
     total_label = create_label(bar, "总帧数 0", 630, 13, 165, lv_color_hex(UI_COLOR_TEXT), 0);
