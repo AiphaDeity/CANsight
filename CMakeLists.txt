@@ -45,6 +45,16 @@ set(CONFIG_LV_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
 # 使用 LVGL 9.6 自带的 CMake 构建脚本
 add_subdirectory(Middlewares/Third_Party/lvgl)
 
+# Debug 对照仅优化 LVGL 库，PRIVATE 防止选项传播到接收、存储和显示驱动。
+option(CANSIGHT_LVGL_DEBUG_O2 "Use -O2 for LVGL in firmware Debug builds" ON)
+if(CANSIGHT_LVGL_DEBUG_O2)
+    target_compile_options(lvgl PRIVATE
+        "$<$<AND:$<CONFIG:Debug>,$<COMPILE_LANG_AND_ID:C,GNU>>:-O2>"
+        "$<$<AND:$<CONFIG:Debug>,$<COMPILE_LANG_AND_ID:CXX,GNU>>:-O2>"
+    )
+endif()
+message(STATUS "LVGL Debug -O2: ${CANSIGHT_LVGL_DEBUG_O2}")
+
 # Link directories setup
 target_link_directories(${CMAKE_PROJECT_NAME} PRIVATE
     # Add user defined library search paths
