@@ -15,7 +15,8 @@ uint16_t CooX,CooY;
 uint8_t touch_buf[4];
 uint8_t touch_event = 0;
 
-__IO uint32_t  I2CTimeout = I2C_Open_FLAG_TIMEOUT;
+// 正常触摸事务约毫秒内完成，故障时不允许单次 HAL 等待长达数秒。
+__IO uint32_t  I2CTimeout = 20U;
 
 static void Set_GPIO_MODER(GPIO_TypeDef* GPIOx, uint32_t moder, uint16_t GPIO_Pin)
 {

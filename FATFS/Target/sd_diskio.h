@@ -46,6 +46,10 @@ typedef struct {
   uint32_t hal_error;        // 在后续状态查询可能改写之前保存 HAL 错误位。
   uint32_t hal_state;        // HAL SD 驱动状态，不等同于卡片协议状态。
   uint32_t sdio_status;      // 部分硬件错误位可能已被 HAL 清除，以 hal_error 为准。
+  uint32_t sdio_command;     // 首故障时的命令寄存器，低六位为命令编号。
+  uint32_t response_command; // 响应命令编号，用于核对响应归属。
+  uint32_t response1;        // 原始卡响应，不在捕获前额外发送状态查询。
+  uint32_t clock_control;    // 首故障时的时钟分频及总线宽度配置。
   uint8_t valid;             // 初始化后尚未发生故障时为 0。
 } SdDiskFault;
 

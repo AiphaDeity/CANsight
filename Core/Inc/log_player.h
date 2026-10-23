@@ -100,4 +100,25 @@ void LogPlayer_Process(void);
 uint8_t LogPlayer_IsBusy(void);
 const LogPlayerView *LogPlayer_GetView(void);
 
+typedef enum {
+    LOG_REPLAY_IDLE = 0, LOG_REPLAY_PREPARING, LOG_REPLAY_RUNNING,
+    LOG_REPLAY_PAUSED, LOG_REPLAY_STOPPING, LOG_REPLAY_DONE, LOG_REPLAY_ERROR
+} LogReplayState;
+
+typedef struct {
+    LogReplayState state;
+    uint32_t sent_frames;
+    uint32_t total_frames;
+    uint32_t max_late_us;
+    uint32_t error; // 1：文件访问，2：CSV，3：CAN 发送，4：等待超时，5：记录同步。
+} LogReplayView;
+
+// 请求仅修改状态；主循环高频调用 ReplayProcess 完成读卡与发送。
+uint8_t LogPlayer_ReplayStart(void);
+void LogPlayer_ReplayPause(void);
+void LogPlayer_ReplayStop(void);
+void LogPlayer_ReplayProcess(void);
+uint8_t LogPlayer_ReplayBusy(void);
+const LogReplayView *LogPlayer_GetReplay(void);
+
 #endif

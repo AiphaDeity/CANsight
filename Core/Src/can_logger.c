@@ -1,6 +1,7 @@
 #include "can_logger.h"
 #include "can_time.h"
 #include "can_timestamp.h"
+#include "perf_diag.h"
 
 #include "fatfs.h"
 #include "main.h"
@@ -57,6 +58,11 @@ static void CanLogger_StopWithError(const char *stage, FRESULT result)
       printf("SD IO: HAL=0x%08lX state=%lu STA=0x%08lX\r\n",
              (unsigned long)fault->hal_error, (unsigned long)fault->hal_state,
              (unsigned long)fault->sdio_status);
+      printf("SD CMD: cmd=%lu respcmd=%lu RESP1=0x%08lX CLKCR=0x%08lX ILLEGAL_CMD=%u\r\n",
+             (unsigned long)(fault->sdio_command & 0x3FU),
+             (unsigned long)fault->response_command,
+             (unsigned long)fault->response1, (unsigned long)fault->clock_control,
+             (unsigned)((fault->hal_error & HAL_SD_ERROR_ILLEGAL_CMD) != 0U));
       printf("SD IO: TX_UNDERRUN=%u RX_OVERRUN=%u DATA_CRC_FAIL=%u DATA_TIMEOUT=%u CMD_TIMEOUT=%u\r\n",
              (unsigned)((fault->hal_error & HAL_SD_ERROR_TX_UNDERRUN) != 0U),
              (unsigned)((fault->hal_error & HAL_SD_ERROR_RX_OVERRUN) != 0U),
@@ -87,7 +93,9 @@ static void CanLogger_RecordDuration(uint32_t *maximum, uint32_t started)
 static FRESULT CanLogger_SyncFile(void)
 {
   uint32_t started = (uint32_t)CanTimestamp_GetUs();
+  PerfScope syncScope = PerfDiag_Begin(PERF_SYNC);
   FRESULT result = f_sync(&logFile);
+  PerfDiag_End(syncScope);
   CanLogger_RecordDuration(&diagnostics.max_sync_us, started);
   if(result == FR_OK) diagnostics.synced_frames = diagnostics.written_frames;
   return result;
@@ -105,7 +113,9 @@ static uint8_t CanLogger_FlushBuffer(void)
   }
 
   uint32_t started = (uint32_t)CanTimestamp_GetUs();
+  PerfScope writeScope = PerfDiag_Begin(PERF_WRITE);
   result = f_write(&logFile, logBuffer, logBufferLength, &bytesWritten);
+  PerfDiag_End(writeScope);
   CanLogger_RecordDuration(&diagnostics.max_write_us, started);
   if ((result != FR_OK) || (bytesWritten != logBufferLength))  //写入失败或写入字节数不符
   {
@@ -328,12 +338,15 @@ static void CanLogger_ArchiveCurrentInternal(void)
 static void CanLogger_ArchiveCurrent(void)
 {
   uint32_t started = (uint32_t)CanTimestamp_GetUs();
+  PerfScope archiveScope = PerfDiag_Begin(PERF_ARCHIVE);
   CanLogger_ArchiveCurrentInternal();
+  PerfDiag_End(archiveScope);
   CanLogger_RecordDuration(&diagnostics.max_archive_us, started);
 }
 
 uint8_t CanLogger_RequestArchive(void)
 {
+  if(logState == CAN_LOG_PAUSED) return 0U;
   if(archiveState == CAN_ARCHIVE_PENDING) return 0U;
   if(logReady == 0U) {
     archiveState = CAN_ARCHIVE_FAILED;
@@ -345,7 +358,7 @@ uint8_t CanLogger_RequestArchive(void)
 }
 
 // 把一帧格式化成CSV行并放入RAM缓冲区。
-void CanLogger_AddFrame(const CanFrame *frame)
+static void CanLogger_AddFrameInternal(const CanFrame *frame)
 {
   char row[96];  //一帧报文格式化成的 CSV 行，足够容纳最长的行
   int rowLength;  //格式化后的行长度
@@ -373,22 +386,24 @@ void CanLogger_AddFrame(const CanFrame *frame)
   }
 
   used = rowLength;  //记录已使用的缓冲区字节数
-  if (frame->rtr == CAN_RTR_DATA)  //如果是数据帧，则格式化数据内容
-  {
-    uint8_t dataLength = (frame->dlc <= 8U) ? frame->dlc : 8U;  //确保数据长度不超过 8 字节
-    for (uint8_t i = 0U; i < dataLength; i++)  //遍历数据字节
-    {
-      int written = snprintf(&row[used], sizeof(row) - (size_t)used,
-                             (i == 0U) ? "%02X" : " %02X",
-                             (unsigned int)frame->data[i]);
-      if ((written < 0) || (written >= (int)(sizeof(row) - (size_t)used)))  //格式化失败或写入字节数不符
-      {
-        diagnostics.rejected_frames++;
-        CanLogger_StopWithError("format data", FR_INT_ERR);  //停止写入并报告错误
-        return;
-      }
-      used += written;   //记录已使用的缓冲区字节数
-    } 
+  if (frame->rtr == CAN_RTR_DATA) {
+    static const char hexDigits[] = "0123456789ABCDEF";
+    uint8_t dataLength = (frame->dlc <= 8U) ? frame->dlc : 8U;
+    // 数据区长度为 3N-1；提前检查完整空间，并为 CRLF 和字符串结束符保留位置。
+    size_t dataBytes = dataLength ? (size_t)dataLength * 3U - 1U : 0U;
+    if(dataBytes + 3U > sizeof(row) - (size_t)used) {
+      diagnostics.rejected_frames++;
+      CanLogger_StopWithError("format data", FR_INT_ERR);
+      return;
+    }
+    // 固定两位大写十六进制，字节间保留单空格，不再逐字节调用格式化库。
+    for(uint8_t i = 0U; i < dataLength; i++) {
+      uint8_t value = frame->data[i];
+      if(i != 0U) row[used++] = ' ';
+      row[used++] = hexDigits[value >> 4];
+      row[used++] = hexDigits[value & 0x0FU];
+    }
+    row[used] = '\0';
   }
 
   
@@ -428,9 +443,19 @@ void CanLogger_AddFrame(const CanFrame *frame)
   logHasFrames = 1U;
 }
 
+// 记录追加包含格式化、复制及控制逻辑；嵌套的文件和等待阶段分别分账。
+void CanLogger_AddFrame(const CanFrame *frame)
+{
+  if(logState == CAN_LOG_PAUSED) return;
+  PerfScope scope = PerfDiag_Begin(PERF_LOGGER);
+  CanLogger_AddFrameInternal(frame);
+  PerfDiag_End(scope);
+}
+
 // 在主循环调用；SD 文件操作不在 CAN 中断中执行。
 void CanLogger_Process(void)
 {
+  if(logState == CAN_LOG_PAUSED) return;
   FRESULT result;  
 
   if(logReady && logHasFrames && (uint32_t)f_size(&logFile) + logBufferLength >= CAN_LOG_MAX_FILE_SIZE) {
@@ -488,6 +513,27 @@ void CanLogger_Process(void)
 uint8_t CanLogger_IsReady(void)  
 {
   return logReady;
+}
+
+uint8_t CanLogger_SetPaused(uint8_t paused)
+{
+  if(!paused) {
+    if(logState == CAN_LOG_PAUSED) {
+      logState = CAN_LOG_RECORDING;
+      lastSyncTick = HAL_GetTick();
+    }
+    return logReady;
+  }
+  if(logState == CAN_LOG_PAUSED) return 1U;
+  if(!logReady || archiveState == CAN_ARCHIVE_PENDING) return 0U;
+  if(!CanLogger_FlushBuffer()) return 0U;
+  FRESULT result = CanLogger_SyncFile();
+  if(result != FR_OK) {
+    CanLogger_StopWithError("pause sync", result);
+    return 0U;
+  }
+  logState = CAN_LOG_PAUSED;
+  return 1U;
 }
 
 CanLoggerState CanLogger_GetState(void) { return logState; }

@@ -22,6 +22,7 @@ static uint32_t archive_revision;           // 上次观察到的归档版本，
 #endif
 
 static LogPlayerView view;                  // 对外发布的文件列表、预览帧和运行状态。
+static LogReplayView replay;
 static char root_path[260];                 // 日志所在目录，不包含具体文件名。
 static uint8_t root_valid;                  // 目录参数非空且长度未超过缓冲区。
 static uint32_t close_error;  // 资源关闭失败后暂停文件访问，避免覆盖尚未释放的对象。
@@ -142,6 +143,7 @@ static uint32_t archive_number(const char *name)
 void LogPlayer_Init(const char *root)
 {
     memset(&view, 0, sizeof(view));
+    memset(&replay, 0, sizeof(replay));
     root_valid = root != NULL && root[0] != '\0' && strlen(root) < sizeof(root_path);
     snprintf(root_path, sizeof(root_path), "%s", root_valid ? root : "");
     close_error = 0U;
@@ -157,6 +159,7 @@ void LogPlayer_Init(const char *root)
 // 更新页面激活状态；停用时取消待处理请求，资源关闭交由主循环执行。
 void LogPlayer_SetActive(uint8_t enabled)
 {
+    if(!enabled) LogPlayer_ReplayStop();
     active = enabled;
     if(!enabled) {
         release_pending = 1U;
@@ -175,6 +178,7 @@ void LogPlayer_SetActive(uint8_t enabled)
 // 请求重新扫描首页，不改变当前选中文件及已经完成的预览内容。
 void LogPlayer_RequestRefresh(void)
 {
+    if(LogPlayer_ReplayBusy()) return;
     if(view.delete_state == LOG_DELETE_PENDING) return;
     if(close_error != 0U) {
         view.list_state = LOG_LIST_ERROR;
@@ -201,6 +205,7 @@ void LogPlayer_RequestRefresh(void)
  */
 void LogPlayer_RequestPage(int direction)
 {
+    if(LogPlayer_ReplayBusy()) return;
     if(view.delete_state == LOG_DELETE_PENDING) return;
     if(close_error != 0U) { LogPlayer_RequestRefresh(); return; }
     if(view.list_state != LOG_LIST_READY || view.file_count == 0U) return;
@@ -224,8 +229,10 @@ void LogPlayer_RequestPage(int direction)
 // 校验并复制文件名，立即清除旧预览，实际关闭和打开操作延后至主循环。
 void LogPlayer_RequestOpen(const char *name)
 {
+    if(LogPlayer_ReplayBusy()) return;
     if(view.delete_state == LOG_DELETE_PENDING) return;
     if(name == NULL || archive_number(name) == 0U) return;
+    replay = (LogReplayView){0};
     if(close_error != 0U) {
         view.preview_state = LOG_PREVIEW_IO_ERROR;
         view.preview_error = close_error;
@@ -244,6 +251,7 @@ void LogPlayer_RequestOpen(const char *name)
 // 筛选只重建只读索引，不修改接收统计、日志内容或归档规则。
 uint8_t LogPlayer_SetFilter(uint32_t id, uint8_t enabled)
 {
+    if(LogPlayer_ReplayBusy()) return 0U;
     if(id > 0x1FFFFFFFU || close_error || view.delete_state == LOG_DELETE_PENDING) return 0U;
     enabled = enabled != 0U;
     if(view.filter_enabled == enabled && (!enabled || view.filter_id == id)) return 1U;
@@ -260,6 +268,7 @@ uint8_t LogPlayer_SetFilter(uint32_t id, uint8_t enabled)
 // 每次移动窗口首帧一条记录；读入最多五个匹配帧，首行为当前帧。
 void LogPlayer_RequestStep(int direction)
 {
+    if(LogPlayer_ReplayBusy()) return;
     if(!active || close_error || !view.index_ready || view.preview_state != LOG_PREVIEW_READY ||
        view.delete_state == LOG_DELETE_PENDING || !view.matched_frames) return;
     if(direction < 0) {
@@ -281,6 +290,7 @@ void LogPlayer_RequestStep(int direction)
 // 请求中锁定已确认的历史文件名；不允许活动日志、任意路径或重复提交。
 uint8_t LogPlayer_RequestDelete(const char *name)
 {
+    if(LogPlayer_ReplayBusy()) return 0U;
     if(!active || !root_valid || close_error || name == NULL ||
        archive_number(name) == 0U || strcmp(name, view.selected_name) != 0 ||
        view.delete_state == LOG_DELETE_PENDING) return 0U;
@@ -778,6 +788,7 @@ static void read_preview(void)
  */
 void LogPlayer_Process(void)
 {
+    if(LogPlayer_ReplayBusy()) return;
     if(close_error != 0U) {
         // 资源关闭失败后不继续覆盖文件对象，需复位重新初始化。
         query_pending = open_pending = storage_pending = 0U;
@@ -861,3 +872,255 @@ uint8_t LogPlayer_IsBusy(void)
 
 // 返回内部数据的只读视图，界面不得修改或释放，后续 Process 可能更新其内容。
 const LogPlayerView *LogPlayer_GetView(void) { return &view; }
+
+const LogReplayView *LogPlayer_GetReplay(void) { return &replay; }
+
+uint8_t LogPlayer_ReplayBusy(void)
+{
+    return replay.state == LOG_REPLAY_PREPARING || replay.state == LOG_REPLAY_RUNNING ||
+           replay.state == LOG_REPLAY_PAUSED || replay.state == LOG_REPLAY_STOPPING;
+}
+
+#ifndef CAN_PLAYER_SIMULATOR
+#include "can.h"
+#include "can_timestamp.h"
+
+#define REPLAY_CAPACITY 64U
+static FIL replay_file;
+static uint8_t replay_open, replay_eof, replay_header, replay_legacy;
+static uint8_t replay_inflight, replay_pause_requested;
+static uint8_t replay_have_previous;
+static uint16_t replay_head, replay_count, replay_bytes, replay_pos, replay_line_used;
+static uint8_t replay_chunk[2048];
+static char replay_line[128];
+static CanFrame replay_frames[REPLAY_CAPACITY];
+static uint64_t replay_previous, replay_first, replay_base, replay_pause_time;
+static uint64_t replay_submitted, replay_stop_time;
+static uint32_t replay_mailbox;
+static LogReplayState replay_final;
+
+static void replay_finish(LogReplayState state, uint32_t error)
+{
+    if(replay_open) {
+        FRESULT result = f_close(&replay_file);
+        if(result != FR_OK) {
+            close_error = (uint32_t)result;
+            state = LOG_REPLAY_ERROR;
+            error = 1U;
+        }
+        replay_open = 0U;
+    }
+    // 只终止本模块提交的邮箱，停止期间继续轮询，避免残留帧混入下一次回放。
+    replay_final = state;
+    replay.error = error;
+    replay.state = LOG_REPLAY_STOPPING;
+    replay_stop_time = CanTimestamp_GetUs();
+    if(replay_inflight) (void)HAL_CAN_AbortTxRequest(&hcan1, replay_mailbox);
+}
+
+// 解析与历史浏览共用严格的 CSV 转换，回放始终包含文件内全部报文。
+static uint8_t replay_consume_line(void)
+{
+    if(replay_line_used && replay_line[replay_line_used - 1U] == '\r') replay_line_used--;
+    replay_line[replay_line_used] = '\0';
+    char *text = replay_line;
+    if(!replay_header) {
+        if(replay_line_used >= 3U && (uint8_t)text[0] == 0xEFU &&
+           (uint8_t)text[1] == 0xBBU && (uint8_t)text[2] == 0xBFU) text += 3;
+        replay_legacy = strcmp(text, "timestamp_us,format,type,id,dlc,data_hex") == 0;
+        if(!replay_legacy && strcmp(text, "timestamp_us64,format,type,id,dlc,data_hex") != 0) return 0U;
+        replay_header = 1U;
+    }
+    else if(*text) {
+        CanFrame frame;
+        if(!parse_frame(text, &frame)) return 0U;
+        if(replay_legacy) {
+            if(frame.timestamp_us > UINT32_MAX) return 0U;
+            uint64_t base = replay_previous & ~((uint64_t)UINT32_MAX);
+            if(replay_have_previous && frame.timestamp_us < (uint32_t)replay_previous) {
+                if(base > UINT64_MAX - (1ULL << 32)) return 0U;
+                base += 1ULL << 32;
+            }
+            frame.timestamp_us += base;
+        }
+        else if(replay_have_previous && frame.timestamp_us < replay_previous) return 0U;
+        replay_previous = frame.timestamp_us;
+        replay_have_previous = 1U;
+        replay_frames[(replay_head + replay_count) % REPLAY_CAPACITY] = frame;
+        replay_count++;
+    }
+    replay_line_used = 0U;
+    return 1U;
+}
+
+// 每轮最多读一个 2 KiB 批次；固定预读队列避免每发一帧都访问 SD。
+static void replay_fill(void)
+{
+    if(replay_eof || replay_count == REPLAY_CAPACITY) return;
+    if(replay_pos == replay_bytes) {
+        UINT bytes = 0U;
+        if(f_read(&replay_file, replay_chunk, sizeof(replay_chunk), &bytes) != FR_OK) {
+            replay_finish(LOG_REPLAY_ERROR, 1U);
+            return;
+        }
+        replay_pos = 0U;
+        replay_bytes = (uint16_t)bytes;
+        if(bytes == 0U) {
+            replay_eof = 1U;
+            if((replay_line_used && !replay_consume_line()) || !replay_header)
+                replay_finish(LOG_REPLAY_ERROR, 2U);
+            return;
+        }
+    }
+    while(replay_pos < replay_bytes && replay_count < REPLAY_CAPACITY) {
+        uint8_t c = replay_chunk[replay_pos++];
+        if(c == '\n') {
+            if(!replay_consume_line()) { replay_finish(LOG_REPLAY_ERROR, 2U); return; }
+        }
+        else {
+            if(c == 0U || replay_line_used >= sizeof(replay_line) - 1U) {
+                replay_finish(LOG_REPLAY_ERROR, 2U);
+                return;
+            }
+            replay_line[replay_line_used++] = (char)c;
+        }
+    }
+}
+
+uint8_t LogPlayer_ReplayStart(void)
+{
+    if(LogPlayer_ReplayBusy() || !active || close_error || !view.index_ready ||
+       !view.total_frames || LogPlayer_IsBusy() || archive_number(view.selected_name) == 0U ||
+       CanLogger_GetState() != CAN_LOG_RECORDING ||
+       CanLogger_GetArchiveState() == CAN_ARCHIVE_PENDING) return 0U;
+    replay = (LogReplayView){ .state = LOG_REPLAY_PREPARING, .total_frames = view.total_frames };
+    replay_open = replay_inflight = replay_pause_requested = 0U;
+    replay_eof = replay_header = replay_have_previous = 0U;
+    replay_head = replay_count = replay_bytes = replay_pos = replay_line_used = 0U;
+    replay_previous = 0U;
+    return 1U;
+}
+
+void LogPlayer_ReplayPause(void)
+{
+    if(replay.state == LOG_REPLAY_RUNNING) replay_pause_requested = 1U;
+    else if(replay.state == LOG_REPLAY_PAUSED) {
+        replay_base += CanTimestamp_GetUs() - replay_pause_time;
+        replay.state = LOG_REPLAY_RUNNING;
+    }
+}
+
+void LogPlayer_ReplayStop(void)
+{
+    // 文件关闭和邮箱取消由主循环执行，不在触摸事件中阻塞。
+    if(LogPlayer_ReplayBusy() && replay.state != LOG_REPLAY_STOPPING) {
+        replay_final = LOG_REPLAY_IDLE;
+        replay.error = 0U;
+        replay.state = LOG_REPLAY_STOPPING;
+        replay_stop_time = 0U;
+    }
+}
+
+void LogPlayer_ReplayProcess(void)
+{
+    if(!LogPlayer_ReplayBusy()) return;
+    if(replay.state == LOG_REPLAY_STOPPING) {
+        if(!replay_stop_time) replay_finish(replay_final, replay.error);
+        if(replay_inflight && HAL_CAN_IsTxMessagePending(&hcan1, replay_mailbox)) {
+            if(CanTimestamp_GetUs() - replay_stop_time > 1000000U) {
+                // 停止 CAN 可确保异常邮箱不在恢复记录后继续发送。
+                (void)HAL_CAN_Stop(&hcan1);
+                (void)HAL_CAN_Start(&hcan1);
+                replay.error = 4U;
+                replay_final = LOG_REPLAY_ERROR;
+            }
+            else return;
+        }
+        replay_inflight = 0U;
+        (void)CanLogger_SetPaused(0U);
+        replay.state = replay_final;
+        return;
+    }
+    if(replay.state == LOG_REPLAY_PAUSED) return;
+    if(replay.state == LOG_REPLAY_PREPARING && !replay_open) {
+        if(!CanLogger_SetPaused(1U)) { replay_finish(LOG_REPLAY_ERROR, 5U); return; }
+        if(close_reader() || close_directory()) { replay_finish(LOG_REPLAY_ERROR, 1U); return; }
+        char path[320];
+        snprintf(path, sizeof(path), "%s/%s", root_path, view.selected_name);
+        if(f_open(&replay_file, path, FA_READ) != FR_OK) { replay_finish(LOG_REPLAY_ERROR, 1U); return; }
+        replay_open = 1U;
+        if(f_size(&replay_file) != view.selected_size) { replay_finish(LOG_REPLAY_ERROR, 1U); return; }
+    }
+    uint64_t now = CanTimestamp_GetUs();
+    if(replay_inflight) {
+        if(HAL_CAN_IsTxMessagePending(&hcan1, replay_mailbox)) {
+            if(now - replay_submitted > 1000000U) replay_finish(LOG_REPLAY_ERROR, 4U);
+            else if(replay_count < REPLAY_CAPACITY / 2U && !replay_pause_requested) replay_fill();
+            return;
+        }
+        uint32_t shift = replay_mailbox == CAN_TX_MAILBOX0 ? 0U :
+                         replay_mailbox == CAN_TX_MAILBOX1 ? 8U : 16U;
+        replay_inflight = 0U;
+        if(!(hcan1.Instance->TSR & (CAN_TSR_TXOK0 << shift))) {
+            replay_finish(LOG_REPLAY_ERROR, 3U);
+            return;
+        }
+        replay.sent_frames++;
+    }
+    if(replay_pause_requested) {
+        replay_pause_requested = 0U;
+        replay_pause_time = now;
+        replay.state = LOG_REPLAY_PAUSED;
+        return;
+    }
+    if(replay.state == LOG_REPLAY_PREPARING) {
+        replay_fill();
+        if(replay.state == LOG_REPLAY_STOPPING) return;
+        if(!replay_eof && replay_count < REPLAY_CAPACITY) return;
+        if(!replay_count) { replay_finish(LOG_REPLAY_ERROR, 2U); return; }
+        replay_first = replay_frames[replay_head].timestamp_us;
+        replay_base = CanTimestamp_GetUs();
+        replay.state = LOG_REPLAY_RUNNING;
+    }
+    if(!replay_count) {
+        if(replay_eof) {
+            replay_finish(replay.sent_frames == replay.total_frames ? LOG_REPLAY_DONE : LOG_REPLAY_ERROR,
+                          replay.sent_frames == replay.total_frames ? 0U : 2U);
+            return;
+        }
+        replay_fill();
+        return;
+    }
+    CanFrame *frame = &replay_frames[replay_head];
+    uint64_t relative = frame->timestamp_us - replay_first;
+    now = CanTimestamp_GetUs();
+    if(now - replay_base >= relative) {
+        CAN_TxHeaderTypeDef header = {0};
+        header.IDE = frame->ide;
+        header.RTR = frame->rtr;
+        header.StdId = frame->ide ? 0U : frame->id;
+        header.ExtId = frame->ide ? frame->id : 0U;
+        header.DLC = frame->dlc;
+        if(!HAL_CAN_GetTxMailboxesFreeLevel(&hcan1) ||
+           HAL_CAN_AddTxMessage(&hcan1, &header, frame->data, &replay_mailbox) != HAL_OK) {
+            replay_finish(LOG_REPLAY_ERROR, 3U);
+            return;
+        }
+        uint64_t late = now - replay_base - relative;
+        uint32_t bounded = late > UINT32_MAX ? UINT32_MAX : (uint32_t)late;
+        if(bounded > replay.max_late_us) replay.max_late_us = bounded;
+        replay_submitted = now;
+        replay_inflight = 1U;
+        replay_head = (replay_head + 1U) % REPLAY_CAPACITY;
+        replay_count--;
+        return;
+    }
+    if(replay_count < REPLAY_CAPACITY / 2U) replay_fill();
+}
+#else
+// 模拟器不连接 CAN 硬件，不模拟发送成功。
+uint8_t LogPlayer_ReplayStart(void) { return 0U; }
+void LogPlayer_ReplayPause(void) {}
+void LogPlayer_ReplayStop(void) {}
+void LogPlayer_ReplayProcess(void) {}
+#endif

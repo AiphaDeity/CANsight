@@ -35,7 +35,8 @@ typedef enum {
   CAN_LOG_UNMOUNTED = 0,  // 文件系统尚未成功挂载。
   CAN_LOG_READY,          // 文件系统已挂载，活动日志尚未就绪。
   CAN_LOG_RECORDING,      // 活动日志已打开，可接受接收记录。
-  CAN_LOG_ERROR           // 日志打开、格式化、写入或同步失败。
+  CAN_LOG_ERROR,          // 日志打开、格式化、写入或同步失败。
+  CAN_LOG_PAUSED          // 回放期间暂停记录，文件保持打开。
 } CanLoggerState;
 
 #define CAN_LOG_ARCHIVE_NAME_SIZE 24U
@@ -77,5 +78,7 @@ void CanLogger_Process(void);
 
 // 返回 1 表示本次运行中的 SD 日志仍可写。
 uint8_t CanLogger_IsReady(void);
+// 暂停前刷出并同步已有记录；暂停期间不计为记录拒收。
+uint8_t CanLogger_SetPaused(uint8_t paused);
 
 #endif /* CAN_LOGGER_H */

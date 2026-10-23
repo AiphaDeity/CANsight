@@ -31,6 +31,27 @@ message("Build type: " ${CMAKE_BUILD_TYPE})
 # Enable CMake support for ASM and C languages
 enable_language(C ASM)
 
+# 从 CubeMX 链接脚本派生 CCM NOLOAD 版本，避免队列零值占用 Flash。
+# 原脚本仍由 CubeMX 维护；格式变化时明确报错，防止悄悄丢失内存布局约束。
+set(cansight_generated_ld "${CMAKE_CURRENT_SOURCE_DIR}/STM32F407xx_FLASH.ld")
+file(READ "${cansight_generated_ld}" cansight_linker_text)
+if(NOT cansight_linker_text MATCHES "[.]ccmram[ \t\r\n]*:")
+    message(FATAL_ERROR "Review generated CCM section before configuring the RX queue")
+endif()
+string(REGEX REPLACE "[.]ccmram[ \t\r\n]*:" ".ccmram (NOLOAD) :" cansight_linker_text "${cansight_linker_text}")
+string(REGEX REPLACE ">CCMRAM[ \t]+AT>[ \t]*FLASH" ">CCMRAM" cansight_linker_text "${cansight_linker_text}")
+set(cansight_memory_ld "${CMAKE_CURRENT_BINARY_DIR}/cansight_memory.ld")
+file(WRITE "${cansight_memory_ld}" "${cansight_linker_text}")
+if(NOT CMAKE_EXE_LINKER_FLAGS MATCHES "STM32F407xx_FLASH[.]ld")
+    message(FATAL_ERROR "Expected generated linker script in toolchain flags")
+endif()
+string(REPLACE "${cansight_generated_ld}" "${cansight_memory_ld}" CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS}")
+string(FIND "${CMAKE_EXE_LINKER_FLAGS}" "${cansight_memory_ld}" cansight_memory_ld_position)
+if(cansight_memory_ld_position EQUAL -1)
+    message(FATAL_ERROR "Cannot select derived CCM linker script; review toolchain path")
+endif()
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${cansight_generated_ld}")
+
 # Create an executable object type
 add_executable(${CMAKE_PROJECT_NAME})
 
@@ -77,6 +98,22 @@ if(CANSIGHT_LCD_FILL_DEBUG_O2)
 endif()
 message(STATUS "LCD fill Debug -O2: ${CANSIGHT_LCD_FILL_DEBUG_O2}")
 
+# 仅优化日志与统计源文件，分别测量应用处理开销，不传播到 HAL 或 SD 适配层。
+option(CANSIGHT_RX_LOG_DEBUG_O2 "Use -O2 for CAN logging and statistics in firmware Debug builds" ON)
+if(CANSIGHT_RX_LOG_DEBUG_O2)
+    set_property(SOURCE
+        "${CMAKE_CURRENT_SOURCE_DIR}/Core/Src/can_logger.c"
+        "${CMAKE_CURRENT_SOURCE_DIR}/Core/Src/can_stats.c"
+        APPEND PROPERTY COMPILE_OPTIONS
+        "$<$<AND:$<CONFIG:Debug>,$<COMPILE_LANG_AND_ID:C,GNU>>:-O2>"
+    )
+endif()
+message(STATUS "CAN RX/log Debug -O2: ${CANSIGHT_RX_LOG_DEBUG_O2}")
+
+# 高频计时边界单独优化，减轻观测开销，不改变被测业务模块的优化开关。
+set_property(SOURCE "${CMAKE_CURRENT_SOURCE_DIR}/Core/Src/perf_diag.c"
+    APPEND PROPERTY COMPILE_OPTIONS "$<$<COMPILE_LANG_AND_ID:C,GNU>:-O2>")
+
 # Link directories setup
 target_link_directories(${CMAKE_PROJECT_NAME} PRIVATE
     # Add user defined library search paths
@@ -87,6 +124,7 @@ target_sources(${CMAKE_PROJECT_NAME} PRIVATE
     # Add user sources here
     ${CMAKE_CURRENT_SOURCE_DIR}/Core/Src/can_logger.c
     ${CMAKE_CURRENT_SOURCE_DIR}/Core/Src/sd_diskio_dma.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/Core/Src/perf_diag.c
     ${CMAKE_CURRENT_SOURCE_DIR}/Core/Src/can_stats.c
     ${CMAKE_CURRENT_SOURCE_DIR}/Core/Src/can_timestamp.c
     ${CMAKE_CURRENT_SOURCE_DIR}/Core/Src/log_player.c
@@ -99,6 +137,8 @@ target_sources(${CMAKE_PROJECT_NAME} PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/GUI/App/ui.c
     ${CMAKE_CURRENT_SOURCE_DIR}/GUI/App/lv_font_cansight_14.c
 )
+
+set_property(TARGET ${CMAKE_PROJECT_NAME} APPEND PROPERTY LINK_DEPENDS "${cansight_memory_ld}")
 
 # Add include paths
 target_include_directories(${CMAKE_PROJECT_NAME} PRIVATE

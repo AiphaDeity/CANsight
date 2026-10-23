@@ -24,6 +24,7 @@
 /* Includes ------------------------------------------------------------------*/
 #include "ff_gen_drv.h"
 #include "sd_diskio.h"
+#include "perf_diag.h"
 #include <string.h>
 
 /* Private typedef -----------------------------------------------------------*/
@@ -99,13 +100,17 @@ static void SD_RecordFault(const char *operation, DWORD sector, UINT blocks,
   firstFault.hal_error = HAL_SD_GetError(&hsd);
   firstFault.hal_state = (uint32_t)HAL_SD_GetState(&hsd);
   firstFault.sdio_status = READ_REG(hsd.Instance->STA);
+  firstFault.sdio_command = READ_REG(hsd.Instance->CMD);
+  firstFault.response_command = READ_REG(hsd.Instance->RESPCMD);
+  firstFault.response1 = READ_REG(hsd.Instance->RESP1);
+  firstFault.clock_control = READ_REG(hsd.Instance->CLKCR);
   firstFault.valid = 1U;
 }
 
 const SdDiskFault *SD_GetFirstFault(void) { return &firstFault; }
 
 // 有界等待卡恢复传输状态；失败后交由 FatFs 向上层报告，不在驱动中重试文件操作。
-static DRESULT SD_WaitReady(const char *operation, DWORD sector, UINT blocks)
+static DRESULT SD_WaitReadyInternal(const char *operation, DWORD sector, UINT blocks)
 {
   uint32_t started = HAL_GetTick();
   while(BSP_SD_GetCardState() != MSD_OK) {
@@ -116,6 +121,15 @@ static DRESULT SD_WaitReady(const char *operation, DWORD sector, UINT blocks)
     }
   }
   return RES_OK;
+}
+
+// 卡就绪等待包括状态查询，只计经过时间，不改变原有超时和错误处理。
+static DRESULT SD_WaitReady(const char *operation, DWORD sector, UINT blocks)
+{
+  PerfScope scope = PerfDiag_Begin(PERF_CARD_READY);
+  DRESULT result = SD_WaitReadyInternal(operation, sector, blocks);
+  PerfDiag_End(scope);
+  return result;
 }
 
 // 故障现场由调用方预先捕获；停止 DMA 后才允许复用缓冲，故障锁存至重新初始化。
@@ -150,12 +164,14 @@ static DRESULT SD_TransferDMA(uint8_t writing, DWORD sector, UINT blocks)
     return RES_ERROR;
   }
 
+  PerfScope waitScope = PerfDiag_Begin(PERF_DMA_WAIT);
   while((writing ? dmaWriteDone : dmaReadDone) == 0U && dmaFailed == 0U) {
     if(HAL_SD_GetError(&hsd) != HAL_SD_ERROR_NONE ||
        HAL_GetTick() - started >= SD_TRANSFER_TIMEOUT_MS) {
       dmaFailed = 1U;
     }
   }
+  PerfDiag_End(waitScope);
   if(dmaFailed || HAL_SD_GetError(&hsd) != HAL_SD_ERROR_NONE) {
     SD_RecordFault(operation, sector, blocks, RES_ERROR, started);
     SD_StopFailedTransfer();

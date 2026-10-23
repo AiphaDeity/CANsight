@@ -17,6 +17,8 @@ void lv_port_indev_get_metrics(LvPortIndevMetrics *metrics)
 
 // 记录最后一次有效坐标，松开时LVGL仍需要最近坐标
 static lv_point_t last_point = {0, 0};
+static uint8_t last_pressed;
+static uint32_t last_touch_tick;
 
 static void gt911_sample(lv_indev_t *indev, lv_indev_data_t *data)
 {
@@ -36,15 +38,17 @@ static void gt911_sample(lv_indev_t *indev, lv_indev_data_t *data)
     if(gt911_read_data(GT_GSTID_REG, &status, 1) != HAL_OK)
     {
         touch_metrics.io_errors++;
+        last_pressed = 0U;
         data->state = LV_INDEV_STATE_RELEASED;  // 触摸状态读取失败
         data->point= last_point;  // 返回上一次触摸点
         return;
     }
 
-    // 触摸点未按下
+    // ready 位未置位只表示暂无新采样，不代表手指已经松开。
     if((status & 0x80U) == 0U) 
     { 
-        data->state = LV_INDEV_STATE_RELEASED; // 触摸状态为松开
+        if(HAL_GetTick() - last_touch_tick >= 100U) last_pressed = 0U;
+        data->state = last_pressed ? LV_INDEV_STATE_PRESSED : LV_INDEV_STATE_RELEASED;
         data->point = last_point; // 返回上一次触摸点
         return;
     }
@@ -54,6 +58,7 @@ static void gt911_sample(lv_indev_t *indev, lv_indev_data_t *data)
 
     if(touch_count == 0U)
     {
+        last_pressed = 0U;
         // 数据已读到，但没有触点：清状态并报告松开
         if(gt911_send_data(GT_GSTID_REG, &clear_status, 1) != HAL_OK) touch_metrics.io_errors++;
         data->state = LV_INDEV_STATE_RELEASED;  // 触摸状态为松开
@@ -65,6 +70,7 @@ static void gt911_sample(lv_indev_t *indev, lv_indev_data_t *data)
     if (gt911_read_data(GT_TP1_REG, point_data, 4) != HAL_OK)
     {
         touch_metrics.io_errors++;
+        last_pressed = 0U;
         data->state = LV_INDEV_STATE_RELEASED;
         data->point = last_point;
         return;
@@ -83,6 +89,8 @@ static void gt911_sample(lv_indev_t *indev, lv_indev_data_t *data)
 
     last_point.x = (lv_coord_t)screen_x;  
     last_point.y = (lv_coord_t)screen_y;  
+    last_pressed = 1U;
+    last_touch_tick = HAL_GetTick();
 
     data->point = last_point;  // 触摸点
     data->state = LV_INDEV_STATE_PRESSED;  //按下
