@@ -1,4 +1,5 @@
 #include "ui.h"
+#include "cansight_config.h"
 #include "can_stats.h"
 #include "log_player.h"
 #include "can_time.h"
@@ -7,6 +8,7 @@
 #include "can_timestamp.h"
 #endif
 
+#if CANSIGHT_DETAILED_DIAGNOSTICS
 static UiDiagnostics ui_diagnostics;
 
 // 固件使用 TIM2 微秒时基；模拟器仅用于界面验证，诊断精度为毫秒。
@@ -19,16 +21,27 @@ static uint32_t ui_diagnostic_time_us(void)
 #endif
 }
 
+#endif
+
 void ui_get_diagnostics(UiDiagnostics *diagnostics)
 {
     if(diagnostics != NULL) {
+#if CANSIGHT_DETAILED_DIAGNOSTICS
         *diagnostics = ui_diagnostics;
+#else
+        *diagnostics = (UiDiagnostics){0};
+#endif
         diagnostics->frozen = UI_DIAG_FREEZE_STATS;
         diagnostics->frozen_rx_metrics = UI_DIAG_FREEZE_RX_METRICS;
     }
 }
 
-void ui_reset_diagnostics(void) { ui_diagnostics = (UiDiagnostics){0}; }
+void ui_reset_diagnostics(void)
+{
+#if CANSIGHT_DETAILED_DIAGNOSTICS
+    ui_diagnostics = (UiDiagnostics){0};
+#endif
+}
 
 LV_FONT_DECLARE(lv_font_cansight_14);
 
@@ -938,12 +951,16 @@ static void refresh_stats_widgets(void)
 // 周期刷新外层计时；冻结模式保留初始化显示，跳过后续周期控件更新。
 static void stats_timer_cb(lv_timer_t *timer)
 {
+#if CANSIGHT_DETAILED_DIAGNOSTICS
     uint32_t started = ui_diagnostic_time_us();
     ui_diagnostics.stats_calls++;
+#endif
     if(timer == NULL || UI_DIAG_FREEZE_STATS == 0) refresh_stats_widgets();
+#if CANSIGHT_DETAILED_DIAGNOSTICS
     uint32_t elapsed = ui_diagnostic_time_us() - started;
     ui_diagnostics.stats_us += elapsed;
     if(elapsed > ui_diagnostics.max_stats_us) ui_diagnostics.max_stats_us = elapsed;
+#endif
 }
 
 //创建状态栏

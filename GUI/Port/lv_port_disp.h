@@ -4,7 +4,7 @@
 #include "lvgl.h"
 #include <stdint.h>
 
-// 累计值按 32 位自然回绕，主循环以相邻快照之差计算单次 LVGL 调用的传输开销。
+// 详细诊断开启时记录，关闭时查询返回 0；累计值按 32 位自然回绕。
 typedef struct {
     uint32_t flush_calls;
     uint32_t flush_us;

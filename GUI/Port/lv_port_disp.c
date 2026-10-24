@@ -2,6 +2,7 @@
 #include "lcd.h"
 #include "main.h"
 #include "can_timestamp.h"
+#include "cansight_config.h"
 #include <stdint.h>
 
 #define LCD_HOR_RES 800
@@ -11,6 +12,7 @@
 // 静态分配缓冲区
 static uint16_t draw_buffer[LCD_BUF_SIZE];
 static lv_display_t *lcd_display;
+#if CANSIGHT_DETAILED_DIAGNOSTICS
 static LvPortDispMetrics display_metrics;
 static LvPortInvalidArea invalid_areas[LV_PORT_INVALID_AREA_LIMIT];
 static uint32_t invalid_area_count;
@@ -100,6 +102,20 @@ void lv_port_disp_get_metrics(LvPortDispMetrics *metrics)
     if(metrics != NULL) *metrics = display_metrics;
 }
 
+#else
+void lv_port_disp_reset_metrics(void) {}
+uint32_t lv_port_disp_get_invalid_areas(LvPortInvalidArea *areas, uint32_t capacity)
+{
+    (void)areas;
+    (void)capacity;
+    return 0U;
+}
+void lv_port_disp_get_metrics(LvPortDispMetrics *metrics)
+{
+    if(metrics != NULL) *metrics = (LvPortDispMetrics){0};
+}
+#endif
+
 // LVGL 通过这个函数获取毫秒计时
 static uint32_t lv_port_get_tick(void)
 {
@@ -109,12 +125,16 @@ static uint32_t lv_port_get_tick(void)
 //LVGL要求刷新的区域坐标右下角也包含在区域内
 static void lcd_flush_cb(lv_display_t *display, const lv_area_t *area, uint8_t *pixel_map)
 {
+#if CANSIGHT_DETAILED_DIAGNOSTICS
     uint32_t started = (uint32_t)CanTimestamp_GetUs();
+#endif
     LCD_Color_Fill((uint16_t)area->x1, (uint16_t)area->y1, (uint16_t)area->x2, (uint16_t)area->y2, (uint16_t *)pixel_map);
+#if CANSIGHT_DETAILED_DIAGNOSTICS
     display_metrics.flush_us += (uint32_t)CanTimestamp_GetUs() - started;
     display_metrics.flush_calls++;
     display_metrics.pixels += (uint32_t)(area->x2 - area->x1 + 1) *
                              (uint32_t)(area->y2 - area->y1 + 1);
+#endif
     // 仅统计 LCD 传输，软件渲染和布局耗时由主循环作差区分。
     lv_display_flush_ready(display);
 }
@@ -131,11 +151,13 @@ void lv_port_disp_init(void)
 
     // 设置显示颜色格式为RGB565
     lv_display_set_color_format(lcd_display, LV_COLOR_FORMAT_RGB565);
+#if CANSIGHT_DETAILED_DIAGNOSTICS
     lv_display_add_event_cb(lcd_display, display_diagnostic_cb, LV_EVENT_INVALIDATE_AREA, NULL);
     lv_display_add_event_cb(lcd_display, display_diagnostic_cb, LV_EVENT_REFR_START, NULL);
     lv_display_add_event_cb(lcd_display, display_diagnostic_cb, LV_EVENT_REFR_READY, NULL);
     lv_display_add_event_cb(lcd_display, display_diagnostic_cb, LV_EVENT_RENDER_START, NULL);
     lv_display_add_event_cb(lcd_display, display_diagnostic_cb, LV_EVENT_RENDER_READY, NULL);
+#endif
 
     // 注册显示刷新回调函数，当LVGL需要刷新屏幕时调用lcd_flush_cb
     lv_display_set_flush_cb(lcd_display, lcd_flush_cb);

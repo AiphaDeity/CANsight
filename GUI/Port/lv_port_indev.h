@@ -4,7 +4,7 @@
 #include "lvgl.h"
 #include <stdint.h>
 
-// 触摸回调累计诊断，主循环以快照之差区分一次 LVGL 调用中的输入处理耗时。
+// io_errors 始终记录；回调次数和耗时仅在详细诊断开启时记录。
 typedef struct {
     uint32_t callbacks;
     uint32_t read_us;

@@ -15,7 +15,7 @@ typedef struct
 } CanFrame;
 
 // 本次初始化以来的日志诊断；归档及新建活动文件不清零累计计数。
-// 帧计数按 uint32_t 自然回绕，耗时以微秒记录，仅读取主循环状态。
+// 帧计数按 uint32_t 自然回绕；耗时仅在详细诊断开启时记录，关闭时为 0。
 typedef struct {
   uint32_t accepted_frames;       // 已完整复制至 RAM 日志缓冲的帧数。
   uint32_t rejected_frames;       // 因日志不可用或本次追加失败而未接纳的帧数。

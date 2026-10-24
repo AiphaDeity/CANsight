@@ -55,6 +55,11 @@ set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${cansight_gener
 # Create an executable object type
 add_executable(${CMAKE_PROJECT_NAME})
 
+option(CANSIGHT_DETAILED_DIAGNOSTICS "Enable detailed timing, UI metrics and verbose serial reports" OFF)
+target_compile_definitions(${CMAKE_PROJECT_NAME} PRIVATE
+    CANSIGHT_DETAILED_DIAGNOSTICS=$<BOOL:${CANSIGHT_DETAILED_DIAGNOSTICS}>)
+message(STATUS "Detailed diagnostics: ${CANSIGHT_DETAILED_DIAGNOSTICS}")
+
 # Add STM32CubeMX generated sources
 add_subdirectory(cmake/stm32cubemx)
 

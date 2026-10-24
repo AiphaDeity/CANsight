@@ -2,6 +2,7 @@
 #define PERF_DIAG_H
 
 #include <stdint.h>
+#include "cansight_config.h"
 
 typedef enum {
     PERF_OTHER, PERF_RX_BATCH, PERF_LOGGER, PERF_STATS, PERF_LOG_PROCESS,
@@ -9,6 +10,7 @@ typedef enum {
     PERF_DMA_WAIT, PERF_CARD_READY, PERF_IDLE, PERF_PHASE_COUNT
 } PerfPhase;
 
+#if CANSIGHT_DETAILED_DIAGNOSTICS
 typedef struct {
     uint32_t started_us;
     uint32_t queue_before;
@@ -26,5 +28,16 @@ void PerfDiag_RecordLossFromISR(uint32_t timestamp_us, uint32_t depth, uint32_t 
 void PerfDiag_SampleQueue(uint32_t depth, uint32_t fifo_frames, uint32_t tick_ms);
 void PerfDiag_Pause(void);
 void PerfDiag_Print(void);
+#else
+// 关闭时不计算实参，不读取时间戳或队列，不分配阶段记录数组。
+typedef uint8_t PerfScope;
+#define PerfDiag_Reset(depth, lost) ((void)0)
+#define PerfDiag_Begin(phase) ((PerfScope)0)
+#define PerfDiag_End(scope) ((void)sizeof(scope))
+#define PerfDiag_RecordLossFromISR(timestamp, depth, fifo) ((void)0)
+#define PerfDiag_SampleQueue(depth, fifo, tick) ((void)0)
+#define PerfDiag_Pause() ((void)0)
+#define PerfDiag_Print() ((void)0)
+#endif
 
 #endif

@@ -1,6 +1,7 @@
 #include "lv_port_indev.h"
 #include "gt911.h"
 #include "can_timestamp.h"
+#include "cansight_config.h"
 #include <stdint.h>
 
 #define TOUCH_LCD_WIDTH  800U
@@ -99,12 +100,16 @@ static void gt911_sample(lv_indev_t *indev, lv_indev_data_t *data)
 // 包装原有输入流程，保留全部失败出口及坐标变换，不在回调中打印。
 static void gt911_read_cb(lv_indev_t *indev, lv_indev_data_t *data)
 {
+#if CANSIGHT_DETAILED_DIAGNOSTICS
     uint32_t started = (uint32_t)CanTimestamp_GetUs();
+#endif
     gt911_sample(indev, data);
+#if CANSIGHT_DETAILED_DIAGNOSTICS
     uint32_t elapsed = (uint32_t)CanTimestamp_GetUs() - started;
     touch_metrics.callbacks++;
     touch_metrics.read_us += elapsed;
     if(elapsed > touch_metrics.max_read_us) touch_metrics.max_read_us = elapsed;
+#endif
 }
 
 void lv_port_indev_init(void)

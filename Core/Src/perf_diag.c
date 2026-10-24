@@ -1,4 +1,5 @@
 #include "perf_diag.h"
+#if CANSIGHT_DETAILED_DIAGNOSTICS
 #include "can_timestamp.h"
 #include "can_time.h"
 #include "main.h"
@@ -192,3 +193,4 @@ void PerfDiag_Print(void)
     last_account_us = (uint32_t)CanTimestamp_GetUs();
     paused = 0U;
 }
+#endif

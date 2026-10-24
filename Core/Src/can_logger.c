@@ -83,20 +83,27 @@ static void CanLogger_StopWithError(const char *stage, FRESULT result)
 }
 
 // 对最长调用耗时保留峰值；低 32 位微秒差值适用于有界的单次文件操作。
+#if CANSIGHT_DETAILED_DIAGNOSTICS
 static void CanLogger_RecordDuration(uint32_t *maximum, uint32_t started)
 {
   uint32_t elapsed = (uint32_t)CanTimestamp_GetUs() - started;
   if(elapsed > *maximum) *maximum = elapsed;
 }
 
+#endif
+
 // 同步成功仅表示 FatFs 及底层驱动已完成同步，不保证故障卡的物理持久性。
 static FRESULT CanLogger_SyncFile(void)
 {
+#if CANSIGHT_DETAILED_DIAGNOSTICS
   uint32_t started = (uint32_t)CanTimestamp_GetUs();
+#endif
   PerfScope syncScope = PerfDiag_Begin(PERF_SYNC);
   FRESULT result = f_sync(&logFile);
   PerfDiag_End(syncScope);
+#if CANSIGHT_DETAILED_DIAGNOSTICS
   CanLogger_RecordDuration(&diagnostics.max_sync_us, started);
+#endif
   if(result == FR_OK) diagnostics.synced_frames = diagnostics.written_frames;
   return result;
 }
@@ -112,11 +119,15 @@ static uint8_t CanLogger_FlushBuffer(void)
     return 1U;  //返回成功
   }
 
+#if CANSIGHT_DETAILED_DIAGNOSTICS
   uint32_t started = (uint32_t)CanTimestamp_GetUs();
+#endif
   PerfScope writeScope = PerfDiag_Begin(PERF_WRITE);
   result = f_write(&logFile, logBuffer, logBufferLength, &bytesWritten);
   PerfDiag_End(writeScope);
+#if CANSIGHT_DETAILED_DIAGNOSTICS
   CanLogger_RecordDuration(&diagnostics.max_write_us, started);
+#endif
   if ((result != FR_OK) || (bytesWritten != logBufferLength))  //写入失败或写入字节数不符
   {
     CanLogger_StopWithError("write", result == FR_OK ? FR_DISK_ERR : result);
@@ -337,11 +348,15 @@ static void CanLogger_ArchiveCurrentInternal(void)
 // 归档耗时包含刷出缓冲、同步、关闭、重命名、新建及状态输出。
 static void CanLogger_ArchiveCurrent(void)
 {
+#if CANSIGHT_DETAILED_DIAGNOSTICS
   uint32_t started = (uint32_t)CanTimestamp_GetUs();
+#endif
   PerfScope archiveScope = PerfDiag_Begin(PERF_ARCHIVE);
   CanLogger_ArchiveCurrentInternal();
   PerfDiag_End(archiveScope);
+#if CANSIGHT_DETAILED_DIAGNOSTICS
   CanLogger_RecordDuration(&diagnostics.max_archive_us, started);
+#endif
 }
 
 uint8_t CanLogger_RequestArchive(void)
