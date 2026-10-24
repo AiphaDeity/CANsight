@@ -92,6 +92,7 @@ static void gt911_read_cb(lv_indev_t *indev, lv_indev_data_t *data)
     data->state = LV_INDEV_STATE_PRESSED;  //按下
 }
 
+// 触摸输入设备初始化
 void lv_port_indev_init(void)
 {
     touch_indev = lv_indev_create();  //创建一个输入设备对象

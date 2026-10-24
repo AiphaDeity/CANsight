@@ -136,10 +136,7 @@ static uint32_t CAN_RxQueue_Depth(void)
 }
 
 
-/**
- * @brief 将控制器状态、日志状态及接收异常计数发布至界面数据层。
- * @note 错误历史与当前状态分别维护，历史错误不阻止正常状态恢复。
- */
+//将控制器状态、日志状态及接收异常计数发布至界面数据层。错误历史与当前状态分别维护，历史错误不阻止正常状态恢复。
 static void CAN_PublishRuntime(void)
 {
   CanStatsRuntime runtime = {0};  // 运行时数据
@@ -201,10 +198,7 @@ static void CAN_RequestArchive(void)
 }
 
 
-/*
-生产者函数：由 CAN 接收中断调用
-把一帧复制进队列；队列满时立即返回，不等待主循环
-*/
+//生产者函数：由CAN接收中断调用，把一帧复制进队列；队列满时立即返回，不等待主循环
 static uint8_t CAN_RxQueue_PushFromISR(const CanFrame *frame) {
   uint32_t head = canRxQueueHead;
 
@@ -231,10 +225,7 @@ static uint8_t CAN_RxQueue_PushFromISR(const CanFrame *frame) {
   return 1U;
 }
 
-/*
-消费者函数：由主循环调用
-从队列中取出一帧；队列空时立即返回，不等待中断
-*/
+//消费者函数：由主循环调用。从队列中取出一帧；队列空时立即返回，不等待中断
 static uint8_t CAN_RxQueue_Pop(CanFrame *frame) {
   uint32_t tail = canRxQueueTail;
 
@@ -260,10 +251,6 @@ static uint8_t CAN_RxQueue_Pop(CanFrame *frame) {
 
 /* USER CODE END 0 */
 
-/**
-  * @brief  The application entry point.
-  * @retval int
-  */
 int main(void)
 {
 
@@ -299,17 +286,17 @@ int main(void)
   MX_I2C1_Init();
   /* USER CODE BEGIN 2 */
 
-  // 启动汇编不初始化 CCM；在启用 CAN 接收前显式清空 NOLOAD 队列。
+  // 启动汇编不初始化CCM；在启用 CAN 接收前显式清空NOLOAD队列。
   __HAL_RCC_CCMDATARAMEN_CLK_ENABLE();
   memset(canRxQueue, 0, sizeof(canRxQueue));
 
-  // GT911 复位及 I2C 地址选择。必须在 LCD_Init 之前执行。
+  // GT911 复位及I2C地址选择。必须在LCD_Init之前执行。
   init_gt911(GT911_I2C_SLAVE);
 
   lv_init();
   lv_port_disp_init();
   lv_port_indev_init();
-  CanStats_Init();  // 在界面读取统计数据前完成模块初始化。
+  CanStats_Init();
   ui_set_archive_callback(CAN_RequestArchive);
   ui_init();
 

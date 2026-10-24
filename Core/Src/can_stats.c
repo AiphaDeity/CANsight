@@ -12,7 +12,7 @@ static CanStatsRuntime runtime_state;
 // 重置所有统计条目及模块计数。
 void CanStats_Init(void)
 {
-    memset(entries, 0, sizeof(entries));  // 同时清除条目计数和周期有效标志。
+    memset(entries, 0, sizeof(entries));
     entry_count = 0;
     total_count = 0;
     untracked_count = 0;
