@@ -102,15 +102,21 @@ const LogPlayerView *LogPlayer_GetView(void);
 
 typedef enum {
     LOG_REPLAY_IDLE = 0, LOG_REPLAY_PREPARING, LOG_REPLAY_RUNNING,
-    LOG_REPLAY_PAUSED, LOG_REPLAY_STOPPING, LOG_REPLAY_DONE, LOG_REPLAY_ERROR
+    LOG_REPLAY_PAUSED, LOG_REPLAY_STOPPING, LOG_REPLAY_DONE, LOG_REPLAY_ERROR,
+    LOG_REPLAY_STOP_FAILED, LOG_REPLAY_STOPPED
 } LogReplayState;
 
 typedef struct {
     LogReplayState state;
     uint32_t sent_frames;
+    uint32_t submitted_frames;
+    uint32_t cancelled_frames;
+    uint32_t failed_frames;
+    uint32_t unconfirmed_frames;
+    uint8_t pending_frames; // 单邮箱发送，取值 0 或 1。
     uint32_t total_frames;
     uint32_t max_late_us;
-    uint32_t error; // 1：文件访问，2：CSV，3：CAN 发送，4：等待超时，5：记录同步。
+    uint32_t error; // 1：文件访问，2：CSV，3：CAN 发送，4：等待超时，5：记录同步，6：停止未确认。
 } LogReplayView;
 
 // 请求仅修改状态；主循环高频调用 ReplayProcess 完成读卡与发送。

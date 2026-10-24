@@ -188,6 +188,7 @@ void LogPlayer_RequestRefresh(void)
         view.revision++;
         return;
     }
+    replay = (LogReplayView){0};
     active = 1U;
     query_direction = 0;
     query_anchor = requested_page = 0U;
@@ -221,6 +222,7 @@ void LogPlayer_RequestPage(int direction)
         requested_page = view.page + 1U;
         query_direction = 1;
     }
+    replay = (LogReplayView){0};
     query_pending = 1U;
     view.list_state = LOG_LIST_SCANNING;
     view.revision++;
@@ -255,6 +257,7 @@ uint8_t LogPlayer_SetFilter(uint32_t id, uint8_t enabled)
     if(id > 0x1FFFFFFFU || close_error || view.delete_state == LOG_DELETE_PENDING) return 0U;
     enabled = enabled != 0U;
     if(view.filter_enabled == enabled && (!enabled || view.filter_id == id)) return 1U;
+    replay = (LogReplayView){0};
     view.filter_enabled = enabled;
     view.filter_id = id;
     if(view.selected_name[0]) {
@@ -279,6 +282,7 @@ void LogPlayer_RequestStep(int direction)
         if(direction == 0 || view.first_match + 1U >= view.matched_frames) return;
         view.first_match++;
     }
+    replay = (LogReplayView){0};
     building_index = 0U;
     view.preview_state = LOG_PREVIEW_LOADING;
     view.frame_count = 0U;
@@ -294,6 +298,7 @@ uint8_t LogPlayer_RequestDelete(const char *name)
     if(!active || !root_valid || close_error || name == NULL ||
        archive_number(name) == 0U || strcmp(name, view.selected_name) != 0 ||
        view.delete_state == LOG_DELETE_PENDING) return 0U;
+    replay = (LogReplayView){0};
     snprintf(view.delete_name, sizeof(view.delete_name), "%s", name);
     view.delete_error = 0U;
     view.delete_state = LOG_DELETE_PENDING;
@@ -878,7 +883,8 @@ const LogReplayView *LogPlayer_GetReplay(void) { return &replay; }
 uint8_t LogPlayer_ReplayBusy(void)
 {
     return replay.state == LOG_REPLAY_PREPARING || replay.state == LOG_REPLAY_RUNNING ||
-           replay.state == LOG_REPLAY_PAUSED || replay.state == LOG_REPLAY_STOPPING;
+           replay.state == LOG_REPLAY_PAUSED || replay.state == LOG_REPLAY_STOPPING ||
+           replay.state == LOG_REPLAY_STOP_FAILED;
 }
 
 #ifndef CAN_PLAYER_SIMULATOR
@@ -898,24 +904,33 @@ static uint64_t replay_previous, replay_first, replay_base, replay_pause_time;
 static uint64_t replay_submitted, replay_stop_time;
 static uint32_t replay_mailbox;
 static LogReplayState replay_final;
+static uint8_t replay_stop_initialized;
+
+// 直接检查硬件邮箱，避免 HAL 状态异常时 IsTxMessagePending 返回 0 被误认为发送结束。
+static uint8_t replay_poll_tx(uint8_t cancelling)
+{
+    if(!replay_inflight) return 1U;
+    uint32_t flags = READ_REG(hcan1.Instance->TSR);
+    if((flags & (replay_mailbox << CAN_TSR_TME0_Pos)) == 0U) return 0U;
+    uint32_t shift = replay_mailbox == CAN_TX_MAILBOX0 ? 0U :
+                     replay_mailbox == CAN_TX_MAILBOX1 ? 8U : 16U;
+    uint8_t success = (flags & (CAN_TSR_RQCP0 << shift)) && (flags & (CAN_TSR_TXOK0 << shift));
+    if(success) replay.sent_frames++;
+    else if(flags & ((CAN_TSR_TERR0 | CAN_TSR_ALST0) << shift)) replay.failed_frames++;
+    else if(cancelling && (flags & (CAN_TSR_RQCP0 << shift))) replay.cancelled_frames++;
+    else replay.unconfirmed_frames++;
+    WRITE_REG(hcan1.Instance->TSR, CAN_TSR_RQCP0 << shift);
+    replay_inflight = replay.pending_frames = 0U;
+    return success ? 1U : 2U;
+}
 
 static void replay_finish(LogReplayState state, uint32_t error)
 {
-    if(replay_open) {
-        FRESULT result = f_close(&replay_file);
-        if(result != FR_OK) {
-            close_error = (uint32_t)result;
-            state = LOG_REPLAY_ERROR;
-            error = 1U;
-        }
-        replay_open = 0U;
-    }
-    // 只终止本模块提交的邮箱，停止期间继续轮询，避免残留帧混入下一次回放。
+    // 统一交给停止状态收尾，先确认邮箱，再关闭文件和恢复记录。
     replay_final = state;
     replay.error = error;
     replay.state = LOG_REPLAY_STOPPING;
-    replay_stop_time = CanTimestamp_GetUs();
-    if(replay_inflight) (void)HAL_CAN_AbortTxRequest(&hcan1, replay_mailbox);
+    replay_stop_initialized = 0U;
 }
 
 // 解析与历史浏览共用严格的 CSV 转换，回放始终包含文件内全部报文。
@@ -1013,30 +1028,44 @@ void LogPlayer_ReplayPause(void)
 void LogPlayer_ReplayStop(void)
 {
     // 文件关闭和邮箱取消由主循环执行，不在触摸事件中阻塞。
-    if(LogPlayer_ReplayBusy() && replay.state != LOG_REPLAY_STOPPING) {
-        replay_final = LOG_REPLAY_IDLE;
-        replay.error = 0U;
-        replay.state = LOG_REPLAY_STOPPING;
-        replay_stop_time = 0U;
-    }
+    if(LogPlayer_ReplayBusy() && replay.state != LOG_REPLAY_STOPPING &&
+       replay.state != LOG_REPLAY_STOP_FAILED) replay_finish(LOG_REPLAY_STOPPED, 0U);
 }
 
 void LogPlayer_ReplayProcess(void)
 {
     if(!LogPlayer_ReplayBusy()) return;
-    if(replay.state == LOG_REPLAY_STOPPING) {
-        if(!replay_stop_time) replay_finish(replay_final, replay.error);
-        if(replay_inflight && HAL_CAN_IsTxMessagePending(&hcan1, replay_mailbox)) {
+    if(replay.state == LOG_REPLAY_STOPPING || replay.state == LOG_REPLAY_STOP_FAILED) {
+        if(!replay_stop_initialized) {
+            replay_stop_initialized = 1U;
+            replay_stop_time = CanTimestamp_GetUs();
+            // 已经发出的帧先记账；取消请求本身不等于硬件已经停止。
+            if(replay_poll_tx(1U) == 0U &&
+               HAL_CAN_AbortTxRequest(&hcan1, replay_mailbox) != HAL_OK) {
+                replay.error = 6U;
+                replay_final = LOG_REPLAY_ERROR;
+                replay.state = LOG_REPLAY_STOP_FAILED;
+            }
+        }
+        if(replay_poll_tx(1U) == 0U) {
             if(CanTimestamp_GetUs() - replay_stop_time > 1000000U) {
-                // 停止 CAN 可确保异常邮箱不在恢复记录后继续发送。
-                (void)HAL_CAN_Stop(&hcan1);
-                (void)HAL_CAN_Start(&hcan1);
-                replay.error = 4U;
+                replay.error = 6U;
+                replay_final = LOG_REPLAY_ERROR;
+                replay.state = LOG_REPLAY_STOP_FAILED;
+            }
+            return; // 未确认停止时保留占用状态及记录暂停，不启动新回放，也不重启 CAN。
+        }
+        if(replay.failed_frames) { replay.error = 3U; replay_final = LOG_REPLAY_ERROR; }
+        if(replay.unconfirmed_frames) { replay.error = 6U; replay_final = LOG_REPLAY_ERROR; }
+        if(replay_open) {
+            FRESULT result = f_close(&replay_file);
+            replay_open = 0U;
+            if(result != FR_OK) {
+                close_error = (uint32_t)result;
+                replay.error = 1U;
                 replay_final = LOG_REPLAY_ERROR;
             }
-            else return;
         }
-        replay_inflight = 0U;
         (void)CanLogger_SetPaused(0U);
         replay.state = replay_final;
         return;
@@ -1053,19 +1082,16 @@ void LogPlayer_ReplayProcess(void)
     }
     uint64_t now = CanTimestamp_GetUs();
     if(replay_inflight) {
-        if(HAL_CAN_IsTxMessagePending(&hcan1, replay_mailbox)) {
+        uint8_t tx_result = replay_poll_tx(0U);
+        if(tx_result == 0U) {
             if(now - replay_submitted > 1000000U) replay_finish(LOG_REPLAY_ERROR, 4U);
             else if(replay_count < REPLAY_CAPACITY / 2U && !replay_pause_requested) replay_fill();
             return;
         }
-        uint32_t shift = replay_mailbox == CAN_TX_MAILBOX0 ? 0U :
-                         replay_mailbox == CAN_TX_MAILBOX1 ? 8U : 16U;
-        replay_inflight = 0U;
-        if(!(hcan1.Instance->TSR & (CAN_TSR_TXOK0 << shift))) {
+        if(tx_result != 1U) {
             replay_finish(LOG_REPLAY_ERROR, 3U);
             return;
         }
-        replay.sent_frames++;
     }
     if(replay_pause_requested) {
         replay_pause_requested = 0U;
@@ -1111,6 +1137,8 @@ void LogPlayer_ReplayProcess(void)
         if(bounded > replay.max_late_us) replay.max_late_us = bounded;
         replay_submitted = now;
         replay_inflight = 1U;
+        replay.pending_frames = 1U;
+        replay.submitted_frames++;
         replay_head = (replay_head + 1U) % REPLAY_CAPACITY;
         replay_count--;
         return;

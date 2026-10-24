@@ -62,6 +62,7 @@
 #define CAN_HISTORY_QUEUE_LIMIT 128U
 // 接收停止且队列排空后输出一次摘要，避免发送期间的周期串口阻塞。
 #define CAN_DIAGNOSTIC_IDLE_MS 1500U
+#define CAN_SERIAL_BUFFER_SIZE 8192U
 #if (CAN_RX_QUEUE_SIZE < 2U) || ((CAN_RX_QUEUE_SIZE & (CAN_RX_QUEUE_SIZE - 1U)) != 0U)
 #error "CAN_RX_QUEUE_SIZE must be a power of two and at least two"
 #endif
@@ -89,6 +90,21 @@
 static CanFrame canRxQueue[CAN_RX_QUEUE_SIZE] __attribute__((section(".ccmram.rx_queue"), aligned(8)));
 static uint8_t canUiDeferred;
 static uint32_t canUiDeferredLoops;
+// printf 仅由主循环使用；发送也在主循环轮询完成，不在 ISR 中调用 printf。
+static uint8_t canSerialBuffer[CAN_SERIAL_BUFFER_SIZE];
+static uint16_t canSerialHead, canSerialTail;
+static uint32_t canSerialDropped;
+
+static void CAN_ServiceSerial(void)
+{
+  if(canSerialHead == canSerialTail) return;
+  // TXE 表示数据寄存器可写；不等待发送完成，不调用阻塞式 HAL_UART_Transmit。
+  if((READ_REG(USART6->SR) & USART_SR_TXE) != 0U &&
+     (READ_REG(USART6->CR1) & (USART_CR1_UE | USART_CR1_TE)) == (USART_CR1_UE | USART_CR1_TE)) {
+    WRITE_REG(USART6->DR, canSerialBuffer[canSerialTail]);
+    canSerialTail = (uint16_t)((canSerialTail + 1U) & (CAN_SERIAL_BUFFER_SIZE - 1U));
+  }
+}
 
 // head 是中断的写入位置；tail 是主循环的读取位置
 static volatile uint16_t canRxQueueHead = 0U;
@@ -208,6 +224,7 @@ static void CAN_PrintPerformance(void)
          (unsigned long)CanStats_GetTotalCount(), (unsigned long)canRxQueueOverflow,
          (unsigned long)canRxFifo0OverrunEvents, (unsigned long)canRxQueuePeak,
          (unsigned long)(CAN_RX_QUEUE_SIZE - 1U));
+  printf("CAN SERIAL: dropped_chars=%lu\r\n", (unsigned long)canSerialDropped);
   printf("CAN PERF us: gap=%lu batch=%lu ui=%lu history=%lu write=%lu sync=%lu archive=%lu\r\n",
          (unsigned long)canMaxServiceGapUs, (unsigned long)canMaxBatchUs,
          (unsigned long)canMaxUiUs, (unsigned long)canMaxHistoryUs,
@@ -457,6 +474,8 @@ int main(void)
 
     /* USER CODE BEGIN 3 */
 
+    CAN_ServiceSerial();
+
     // 回放使用微秒时间戳，每轮服务发送邮箱；不受历史浏览的 5 ms 调度限制。
     LogPlayer_ReplayProcess();
 
@@ -581,15 +600,17 @@ int main(void)
       performancePending = 1U;
     }
     else if(performancePending && !LogPlayer_ReplayBusy() && canRxQueueHead == canRxQueueTail &&
+            canSerialHead == canSerialTail &&
             HAL_GetTick() - lastReceiveTick >= CAN_DIAGNOSTIC_IDLE_MS) {
       performancePending = 0U;
       CAN_PrintPerformance();
-      // 静默期间的串口输出不计为下一轮接收处理停顿。
+      // 摘要仅格式化入队；串口逐字节发送期间仍正常处理接收。
       lastServiceUs = (uint32_t)CanTimestamp_GetUs();
     }
 
     // 仅在没有接收积压时短暂让出 CPU；有积压立即进入下一批处理。
-    if(canRxQueueHead == canRxQueueTail && !LogPlayer_ReplayBusy()) {
+    CAN_ServiceSerial();
+    if(canRxQueueHead == canRxQueueTail && !LogPlayer_ReplayBusy() && canSerialHead == canSerialTail) {
       PerfScope idleScope = PerfDiag_Begin(PERF_IDLE);
       HAL_Delay(1);
       PerfDiag_End(idleScope);
@@ -645,8 +666,13 @@ void SystemClock_Config(void)
 
 /* USER CODE BEGIN 4 */
 int __io_putchar(int ch) {
-  uint8_t byte = (uint8_t)ch;
-  HAL_UART_Transmit(&huart6, &byte, 1, HAL_MAX_DELAY);
+  uint16_t next = (uint16_t)((canSerialHead + 1U) & (CAN_SERIAL_BUFFER_SIZE - 1U));
+  if(next == canSerialTail) {
+    canSerialDropped++; // 诊断队列满只丢字符，不阻塞 CAN 接收。
+    return ch;
+  }
+  canSerialBuffer[canSerialHead] = (uint8_t)ch;
+  canSerialHead = next;
   return ch;
 }
 

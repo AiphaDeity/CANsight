@@ -581,20 +581,9 @@ static void refresh_history_status(const LogPlayerView *view)
         if(view->delete_state == LOG_DELETE_DONE) set_history_message("File deleted");
     }
     const CanStatsRuntime *runtime = CanStats_GetRuntime();
-    if(replay->state != LOG_REPLAY_IDLE) {
-        static const char * const states[] = {
-            "", "Preparing replay", "Replaying", "Paused", "Stopping", "Replay complete", "Replay error"
-        };
-        lv_snprintf(text, sizeof(text), "%s %lu/%lu | late %lu ms%s",
-            states[replay->state], (unsigned long)replay->sent_frames,
-            (unsigned long)replay->total_frames, (unsigned long)(replay->max_late_us / 1000U),
-            LogPlayer_ReplayBusy() ? " | recording paused" : "");
-        if(replay->state == LOG_REPLAY_ERROR) {
-            lv_snprintf(text, sizeof(text), "Replay error %lu; sent %lu/%lu",
-                (unsigned long)replay->error, (unsigned long)replay->sent_frames,
-                (unsigned long)replay->total_frames);
-            color = 0xE35B5B;
-        }
+    if(replay->state == LOG_REPLAY_STOP_FAILED) {
+        lv_snprintf(text, sizeof(text), "Stop unconfirmed; recording paused; reset required");
+        color = 0xE35B5B;
     }
     else if(view->delete_state == LOG_DELETE_ERROR) {
         lv_snprintf(text, sizeof(text), "Delete failed: %lu (%s)",
@@ -619,6 +608,11 @@ static void refresh_history_status(const LogPlayerView *view)
         lv_snprintf(text, sizeof(text), "Archive failed; see SD error");
         color = 0xE35B5B;
     }
+    else if(view->storage_state == LOG_STORAGE_ERROR) {
+        lv_snprintf(text, sizeof(text), "Capacity error: %lu (%s)",
+            (unsigned long)view->storage_error, fatfs_error_name(view->storage_error));
+        color = 0xE35B5B;
+    }
     else if(view->delete_state == LOG_DELETE_PENDING) lv_snprintf(text, sizeof(text), "Deleting...");
     else if(archive_callback != NULL && runtime->archive_state == CAN_ARCHIVE_PENDING)
         lv_snprintf(text, sizeof(text), "Archiving...");
@@ -630,6 +624,30 @@ static void refresh_history_status(const LogPlayerView *view)
     else if(view->list_state == LOG_LIST_SCANNING) lv_snprintf(text, sizeof(text), "Scanning...");
     else if(history_message[0] && lv_tick_get() - history_message_tick < 3000U)
         lv_snprintf(text, sizeof(text), "%s", history_message);
+    else if(replay->state != LOG_REPLAY_IDLE) {
+        static const char * const states[] = {
+            "", "Preparing replay", "Replaying", "Paused", "Stopping", "Replay complete", "Replay error",
+            "Stop unconfirmed", "Stopped"
+        };
+        lv_snprintf(text, sizeof(text), "%s %lu/%lu | late %lu ms%s",
+            states[replay->state], (unsigned long)replay->sent_frames,
+            (unsigned long)replay->total_frames, (unsigned long)(replay->max_late_us / 1000U),
+            LogPlayer_ReplayBusy() ? " | recording paused" : "");
+        if(replay->state == LOG_REPLAY_ERROR || replay->state == LOG_REPLAY_STOP_FAILED) {
+            lv_snprintf(text, sizeof(text), "Error %lu; sent %lu | cancel %lu | fail %lu | unknown %lu",
+                (unsigned long)replay->error, (unsigned long)replay->sent_frames,
+                (unsigned long)replay->cancelled_frames, (unsigned long)replay->failed_frames,
+                (unsigned long)replay->unconfirmed_frames);
+            if(replay->state == LOG_REPLAY_STOP_FAILED)
+                lv_snprintf(text, sizeof(text), "Stop unconfirmed; recording paused; reset required");
+            color = 0xE35B5B;
+        }
+        else if(replay->state == LOG_REPLAY_STOPPED) {
+            lv_snprintf(text, sizeof(text), "Stopped; sent %lu | cancel %lu | fail %lu | unknown %lu",
+                (unsigned long)replay->sent_frames, (unsigned long)replay->cancelled_frames,
+                (unsigned long)replay->failed_frames, (unsigned long)replay->unconfirmed_frames);
+        }
+    }
     else if(view->preview_state == LOG_PREVIEW_EMPTY)
         lv_snprintf(text, sizeof(text), "%s", view->total_frames ? "No matching frames" : "Empty log");
     else if(view->total_files == 0U) lv_snprintf(text, sizeof(text), "No history logs");
