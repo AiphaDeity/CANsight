@@ -89,17 +89,6 @@ static uint8_t canSerialBuffer[CAN_SERIAL_BUFFER_SIZE];
 static uint16_t canSerialHead, canSerialTail;
 static uint32_t canSerialDropped;
 
-static void CAN_ServiceSerial(void)
-{
-  if(canSerialHead == canSerialTail) return;
-  // TXE 表示数据寄存器可写；不等待发送完成，不调用阻塞式 HAL_UART_Transmit。
-  if((READ_REG(USART6->SR) & USART_SR_TXE) != 0U &&
-     (READ_REG(USART6->CR1) & (USART_CR1_UE | USART_CR1_TE)) == (USART_CR1_UE | USART_CR1_TE)) {
-    WRITE_REG(USART6->DR, canSerialBuffer[canSerialTail]);
-    canSerialTail = (uint16_t)((canSerialTail + 1U) & (CAN_SERIAL_BUFFER_SIZE - 1U));
-  }
-}
-
 // head 是中断的写入位置；tail 是主循环的读取位置
 static volatile uint16_t canRxQueueHead = 0U;
 static volatile uint16_t canRxQueueTail = 0U;
@@ -123,18 +112,35 @@ static volatile uint32_t canRxQueuePeak;  // 由生产者更新，避免读改�
 /* Private function prototypes -----------------------------------------------*/
 void SystemClock_Config(void);
 /* USER CODE BEGIN PFP */
-
+static void CAN_ServiceSerial(void);
+static uint32_t CAN_RxQueue_Depth(void);
+static void CAN_PublishRuntime(void);
+static void CAN_PrintSummary(void);
+static void CAN_RequestArchive(void);
+static uint8_t CAN_RxQueue_PushFromISR(const CanFrame *frame);
+static uint8_t CAN_RxQueue_Pop(CanFrame *frame);
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
+
+//非阻塞的串口发送函数，用于从环形缓冲区发送CAN串口数据
+static void CAN_ServiceSerial(void)
+{
+  if(canSerialHead == canSerialTail) return;
+  // TXE 表示数据寄存器可写；不等待发送完成，不调用阻塞式 HAL_UART_Transmit。
+  if((READ_REG(USART6->SR) & USART_SR_TXE) != 0U &&
+     (READ_REG(USART6->CR1) & (USART_CR1_UE | USART_CR1_TE)) == (USART_CR1_UE | USART_CR1_TE)) {
+    WRITE_REG(USART6->DR, canSerialBuffer[canSerialTail]);
+    canSerialTail = (uint16_t)((canSerialTail + 1U) & (CAN_SERIAL_BUFFER_SIZE - 1U));
+  }
+}
 
 // 只读队列快照供主循环诊断使用，不改变生产者和消费者索引。
 static uint32_t CAN_RxQueue_Depth(void)
 {
   return ((uint32_t)canRxQueueHead - canRxQueueTail) & CAN_RX_QUEUE_MASK;
 }
-
 
 //将控制器状态、日志状态及接收异常计数发布至界面数据层。错误历史与当前状态分别维护，历史错误不阻止正常状态恢复。
 static void CAN_PublishRuntime(void)
@@ -190,13 +196,11 @@ static void CAN_PrintSummary(void)
          (unsigned long)lv_port_indev_get_io_errors(), (unsigned long)canSerialDropped);
 }
 
-
 // 界面回调仅提交请求，不在 LVGL 事件中直接访问文件系统。
 static void CAN_RequestArchive(void)
 {
   (void)CanLogger_RequestArchive();
 }
-
 
 //生产者函数：由CAN接收中断调用，把一帧复制进队列；队列满时立即返回，不等待主循环
 static uint8_t CAN_RxQueue_PushFromISR(const CanFrame *frame) {
@@ -216,7 +220,7 @@ static uint8_t CAN_RxQueue_PushFromISR(const CanFrame *frame) {
   canRxQueue[head] = *frame;
 
   // 确保帧内容先写完，再发布新的 head 索引，防止主循环读取到不完整的帧
-  __DMB(); // 数据同步屏障，确保内存访问顺序
+  __DMB(); // 数据内存屏障，确保内存访问顺序
 
   canRxQueueHead = (uint16_t)nextHead; // 发布完整报文后更新生产者位置。
   uint32_t depth = (nextHead - canRxQueueTail) & CAN_RX_QUEUE_MASK;
@@ -242,7 +246,7 @@ static uint8_t CAN_RxQueue_Pop(CanFrame *frame) {
   *frame = canRxQueue[tail];
 
   // 复制完成后，移动 tail，释放这个槽位给生产者
-  __DMB(); // 数据同步屏障，确保内存访问顺序
+  __DMB(); // 数据内存屏障，确保内存访问顺序
 
   canRxQueueTail = (uint16_t)((tail + 1U) & CAN_RX_QUEUE_MASK); // 更新 tail 索引
 
@@ -380,9 +384,10 @@ int main(void)
 
     /* USER CODE BEGIN 3 */
 
+    // 非阻塞的串口发送函数，用于从环形缓冲区发送CAN串口数据
     CAN_ServiceSerial();
 
-    // 回放使用微秒时间戳，每轮服务发送邮箱；不受历史浏览的 5 ms 调度限制。
+    // 回放核心处理函数，使用微秒时间戳，每轮服务发送邮箱；不受历史浏览的 5 ms 调度限制。
     LogPlayer_ReplayProcess();
 
     // 优先消费接收队列；时间预算只在完整报文之间检查，不中断文件操作。

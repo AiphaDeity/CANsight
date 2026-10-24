@@ -80,7 +80,7 @@ typedef struct {
 
 /**
  * @brief 初始化历史文件读取模块。
- * @param root 固件传入 SDPath，模拟器传入本机日志目录。
+ * @param root SD 卡根路径，由 SDPath 提供。
  * @note 所有接口仅在主循环及其 LVGL 回调中调用，不支持中断并发访问。
  *       初始化仅在启动阶段执行一次；页面切换使用 SetActive 和请求接口。
  */

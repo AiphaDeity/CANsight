@@ -512,7 +512,7 @@ static void tab_event_cb(lv_event_t *event)
  */
 static const char *fatfs_error_name(uint32_t error)
 {
-    // 错误值对应当前 FatFs ff.h 的 FRESULT 定义，模拟器不依赖文件系统头文件。
+    // 错误值对应当前 FatFs ff.h 的 FRESULT 定义。
     static const char * const names[] = {
         "FR_OK", "FR_DISK_ERR", "FR_INT_ERR", "FR_NOT_READY", "FR_NO_FILE",
         "FR_NO_PATH", "FR_INVALID_NAME", "FR_DENIED", "FR_EXIST", "FR_INVALID_OBJECT",
@@ -637,9 +637,6 @@ static void refresh_player(void)
     const LogReplayView *replay = LogPlayer_GetReplay();
     bool replay_busy = LogPlayer_ReplayBusy() != 0U;
     lv_obj_set_disabled(replay_start_button, replay_busy || !view->index_ready || !view->total_frames);
-#ifdef CAN_PLAYER_SIMULATOR
-    lv_obj_set_disabled(replay_start_button, true);
-#endif
     lv_obj_set_disabled(replay_pause_button,
         replay->state != LOG_REPLAY_RUNNING && replay->state != LOG_REPLAY_PAUSED);
     lv_obj_set_disabled(replay_stop_button, !replay_busy);

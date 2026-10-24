@@ -5,21 +5,10 @@
 #include <string.h>
 
 // 读取流程：界面提交请求，主循环分批访问文件系统，结果通过 view 提供给界面。
-// 两个平台共用目录分页和 CSV 解析，仅文件、目录访问接口不同。
-#ifdef CAN_PLAYER_SIMULATOR
-#include <windows.h>
-#include <io.h>
-#include <errno.h>
-static FILE *reader;                         // 模拟器当前打开的只读文件。
-static intptr_t directory = -1;             // Windows 目录搜索句柄，-1 表示无效。
-static struct _finddata_t directory_entry;   // 最近一次目录搜索得到的条目。
-static uint8_t directory_first;             // 首个条目已由 _findfirst 返回，无需立即调用 _findnext。
-#else
 #include "fatfs.h"
 static FIL reader;                          // 历史文件对象，与日志模块的写入对象独立。
 static DIR directory;                       // 分批扫描期间持续保留的目录对象。
 static uint32_t archive_revision;           // 上次观察到的归档版本，用于检测新增历史文件。
-#endif
 
 static LogPlayerView view;                  // 对外发布的文件列表、预览帧和运行状态。
 static LogReplayView replay;
@@ -81,16 +70,9 @@ static uint32_t close_directory(void)
 {
     if(!directory_open) return 0U;
     directory_open = 0U;
-#ifdef CAN_PLAYER_SIMULATOR
-    int result = _findclose(directory);
-    directory = -1;
-    if(result != 0) close_error = 1U;
-    return result == 0 ? 0U : 1U;
-#else
     uint32_t result = (uint32_t)f_closedir(&directory);
     if(result != 0U) close_error = result;
     return result;
-#endif
 }
 
 // 结束历史文件访问；关闭失败时锁存错误，后续访问暂停至模块重新初始化。
@@ -98,16 +80,9 @@ static uint32_t close_reader(void)
 {
     if(!reader_open) return 0U;
     reader_open = 0U;
-#ifdef CAN_PLAYER_SIMULATOR
-    int result = fclose(reader);
-    reader = NULL;
-    if(result != 0) close_error = 1U;
-    return result == 0 ? 0U : 1U;
-#else
     uint32_t result = (uint32_t)f_close(&reader);
     if(result != 0U) close_error = result;
     return result;
-#endif
 }
 
 // 校验标准归档名称，拒绝路径分隔符、活动文件及非规范的重复编号名称。
@@ -151,9 +126,7 @@ void LogPlayer_Init(const char *root)
     active = query_pending = open_pending = storage_pending = 0U;
     checkpoint_count = building_index = read_turn = 0U;
     release_pending = 0U;
-#ifndef CAN_PLAYER_SIMULATOR
     archive_revision = CanLogger_GetArchiveRevision();
-#endif
 }
 
 // 更新页面激活状态；停用时取消待处理请求，资源关闭交由主循环执行。
@@ -306,21 +279,6 @@ uint8_t LogPlayer_RequestDelete(const char *name)
     return 1U;
 }
 
-#ifdef CAN_PLAYER_SIMULATOR
-// 本机错误转换为共用界面使用的 FRESULT 数值，不暴露平台相关错误编号。
-static uint32_t windows_error(void)
-{
-    switch(GetLastError()) {
-        case ERROR_FILE_NOT_FOUND: return 4U;
-        case ERROR_PATH_NOT_FOUND: return 5U;
-        case ERROR_ACCESS_DENIED: case ERROR_DISK_FULL: return 7U;
-        case ERROR_WRITE_PROTECT: return 10U;
-        case ERROR_SHARING_VIOLATION: case ERROR_LOCK_VIOLATION: return 16U;
-        case ERROR_NOT_READY: return 3U;
-        default: return 1U;
-    }
-}
-#endif
 
 // 容量查询独立于目录、预览和写入状态；失败时不使用上次结果冒充当前容量。
 static void read_storage(void)
@@ -329,16 +287,6 @@ static void read_storage(void)
     uint32_t error = 0U;
     view.total_bytes = view.free_bytes = 0U;
     if(!root_valid) error = 6U;
-#ifdef CAN_PLAYER_SIMULATOR
-    else {
-        ULARGE_INTEGER available, total, free_space;
-        if(!GetDiskFreeSpaceExA(root_path, &available, &total, &free_space)) error = windows_error();
-        else {
-            view.total_bytes = total.QuadPart;
-            view.free_bytes = available.QuadPart;
-        }
-    }
-#else
     else {
         DWORD free_clusters;
         FATFS *filesystem;
@@ -355,7 +303,6 @@ static void read_storage(void)
             view.free_bytes = (uint64_t)free_clusters * cluster_bytes;
         }
     }
-#endif
     view.storage_error = error;
     view.storage_state = error ? LOG_STORAGE_ERROR : LOG_STORAGE_READY;
     view.revision++;
@@ -371,18 +318,11 @@ static void delete_history(void)
     char path[320];
     snprintf(path, sizeof(path), "%s/%s", root_path, view.delete_name);
     if(!error) {
-#ifdef CAN_PLAYER_SIMULATOR
-        DWORD attributes = GetFileAttributesA(path);
-        if(attributes == INVALID_FILE_ATTRIBUTES) error = windows_error();
-        else if(attributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT)) error = 7U;
-        else if(!DeleteFileA(path)) error = windows_error();
-#else
         FILINFO info;
         error = (uint32_t)f_stat(path, &info);
         // 同名目录不可删除，活动文件已由请求接口的名称检查排除。
         if(!error && (info.fattrib & AM_DIR)) error = (uint32_t)FR_DENIED;
         if(!error) error = (uint32_t)f_unlink(path);
-#endif
     }
     view.delete_error = error;
     view.delete_state = error ? LOG_DELETE_ERROR : LOG_DELETE_DONE;
@@ -440,16 +380,8 @@ static void start_query(void)
     view.list_error = 0U;
     candidate_count = 0U;
     scan_total = 0U;
-#ifdef CAN_PLAYER_SIMULATOR
-    char pattern[320];
-    snprintf(pattern, sizeof(pattern), "%s/*", root_path);
-    directory = _findfirst(pattern, &directory_entry);
-    if(directory == -1) { list_failed(5U); return; }
-    directory_first = 1U;
-#else
     FRESULT result = f_opendir(&directory, root_path);
     if(result != FR_OK) { list_failed((uint32_t)result); return; }
-#endif
     directory_open = 1U;
 }
 
@@ -460,20 +392,6 @@ static void scan_directory(void)
     for(unsigned step = 0; step < 4U; step++) {
         LogHistoryFile file = {0};
         uint8_t end = 0U;
-#ifdef CAN_PLAYER_SIMULATOR
-        if(!directory_first && _findnext(directory, &directory_entry) != 0) {
-            if(errno != ENOENT) { list_failed(1U); return; }
-            end = 1U;
-        }
-        directory_first = 0U;
-        if(!end && !(directory_entry.attrib & _A_SUBDIR)) {
-            file.number = archive_number(directory_entry.name);
-            if(file.number) {
-                snprintf(file.name, sizeof(file.name), "%.*s", (int)sizeof(file.name) - 1, directory_entry.name);
-                file.size = (uint32_t)directory_entry.size;
-            }
-        }
-#else
         FILINFO info;
         FRESULT result = f_readdir(&directory, &info);
         if(result != FR_OK) { list_failed((uint32_t)result); return; }
@@ -485,7 +403,6 @@ static void scan_directory(void)
                 file.size = (uint32_t)info.fsize;
             }
         }
-#endif
         if(end) {
             uint32_t error = close_directory();
             if(error != 0U) { list_failed(error); return; }
@@ -528,30 +445,9 @@ static void start_preview(void)
     char path[320];
     uint32_t expected_size = view.selected_size;
     snprintf(path, sizeof(path), "%s/%s", root_path, view.selected_name);
-#ifdef CAN_PLAYER_SIMULATOR
-    reader = fopen(path, "rb");
-    if(reader == NULL) {
-        preview_failed(LOG_PREVIEW_IO_ERROR, errno == ENOENT ? 4U : errno == EACCES ? 7U : 1U);
-        return;
-    }
-    // 模拟器通过文件定位获得大小，随后回到文件开头，保证首行仍为 CSV 表头。
-    if(fseek(reader, 0, SEEK_END) != 0) {
-        reader_open = 1U;
-        preview_failed(LOG_PREVIEW_IO_ERROR, 1U);
-        return;
-    }
-    long size = ftell(reader);
-    if(size < 0 || fseek(reader, 0, SEEK_SET) != 0) {
-        reader_open = 1U;
-        preview_failed(LOG_PREVIEW_IO_ERROR, 1U);
-        return;
-    }
-    view.selected_size = (uint32_t)size;
-#else
     FRESULT result = f_open(&reader, path, FA_READ);
     if(result != FR_OK) { preview_failed(LOG_PREVIEW_IO_ERROR, (uint32_t)result); return; }
     view.selected_size = (uint32_t)f_size(&reader);
-#endif
     reader_open = 1U;
     if(!building_index && view.selected_size != expected_size) {
         preview_failed(LOG_PREVIEW_IO_ERROR, 9U);
@@ -566,11 +462,7 @@ static void start_preview(void)
             if(checkpoints[i].matches > view.first_match) break;
             cursor = checkpoints[i];
         }
-#ifdef CAN_PLAYER_SIMULATOR
-        if(fseek(reader, (long)cursor.offset, SEEK_SET) != 0) error = 1U;
-#else
         error = (uint32_t)f_lseek(&reader, cursor.offset);
-#endif
         if(error) { preview_failed(LOG_PREVIEW_IO_ERROR, error); return; }
     }
     line_offset = cursor.offset;
@@ -742,15 +634,10 @@ static void finish_scan(void)
 static void read_preview(void)
 {
     unsigned length;
-#ifdef CAN_PLAYER_SIMULATOR
-    length = (unsigned)fread(chunk, 1U, sizeof(chunk), reader);
-    if(ferror(reader)) { preview_failed(LOG_PREVIEW_IO_ERROR, 1U); return; }
-#else
     UINT bytes;
     FRESULT result = f_read(&reader, chunk, sizeof(chunk), &bytes);
     if(result != FR_OK) { preview_failed(LOG_PREVIEW_IO_ERROR, (uint32_t)result); return; }
     length = bytes;
-#endif
     // 历史文件应保持只读；读取期间大小变化时终止，防止继续使用失效索引。
     if(cursor.offset > view.selected_size || length > view.selected_size - cursor.offset ||
        (length == 0U && cursor.offset != view.selected_size)) {
@@ -826,7 +713,6 @@ void LogPlayer_Process(void)
         if(error) list_failed(error);
         return;
     }
-#ifndef CAN_PLAYER_SIMULATOR
     uint32_t revision = CanLogger_GetArchiveRevision();
     // 手动或自动归档生成新文件后，历史页刷新至首页；切页本身不触发归档。
     if(revision != archive_revision) {
@@ -851,7 +737,6 @@ void LogPlayer_Process(void)
            view.preview_state == LOG_PREVIEW_INDEXING) preview_failed(LOG_PREVIEW_IO_ERROR, 3U);
         return;
     }
-#endif
     if(view.delete_state == LOG_DELETE_PENDING) { delete_history(); return; }
     // 新请求优先于旧任务；打开新文件时由 start_preview 统一结束旧读取。
     if(query_pending) { start_query(); return; }
@@ -868,7 +753,7 @@ void LogPlayer_Process(void)
     }
 }
 
-// 模拟器据此缩短空闲等待时间，不代表本模块使用独立线程。
+// 查询历史浏览是否仍有待处理的目录、文件或索引操作。
 uint8_t LogPlayer_IsBusy(void)
 {
     return active && !close_error && (release_pending || query_pending || open_pending || directory_open || reader_open ||
@@ -887,7 +772,6 @@ uint8_t LogPlayer_ReplayBusy(void)
            replay.state == LOG_REPLAY_STOP_FAILED;
 }
 
-#ifndef CAN_PLAYER_SIMULATOR
 #include "can.h"
 #include "can_timestamp.h"
 
@@ -1145,10 +1029,3 @@ void LogPlayer_ReplayProcess(void)
     }
     if(replay_count < REPLAY_CAPACITY / 2U) replay_fill();
 }
-#else
-// 模拟器不连接 CAN 硬件，不模拟发送成功。
-uint8_t LogPlayer_ReplayStart(void) { return 0U; }
-void LogPlayer_ReplayPause(void) {}
-void LogPlayer_ReplayStop(void) {}
-void LogPlayer_ReplayProcess(void) {}
-#endif

@@ -147,21 +147,9 @@ Debug 保留调试信息，并对 LVGL、LCD 像素填充及接收日志相关�
 - 存储故障等待可能超过接收缓冲余量，无法保证SD异常期间仍无丢帧。
 - 暂未迁移RTOS或增加LCD DMA，回放期间不记录新接收数据。
 
-## Windows 模拟器
+## 历史模拟器版本
 
-模拟器用于界面和 CSV 浏览，不连接 CAN 硬件，也不模拟回放发送成功。与开发板共用 UI、统计和历史解析代码。
-
-使用 Windows 本机 GCC（例如 MSYS2 UCRT64），不能使用 ARM 工具链：
-
-```powershell
-cmake -S simulator -B simulator/build -G Ninja `
-  -DCMAKE_C_COMPILER=C:/msys64/ucrt64/bin/gcc.exe `
-  -DCMAKE_CXX_COMPILER=C:/msys64/ucrt64/bin/g++.exe
-cmake --build simulator/build --target cansight_sim --parallel 4
-.\simulator\build\cansight_sim.exe
-```
-
-按本机安装位置修改路径，并将对应运行库目录加入 PATH。历史日志放入 `simulator/logs/`，或将目录作为程序参数传入；本机日志不提交到 Git。
+当前工程只保留 STM32 实机版本。需要 Windows 模拟器时，可从 Git 提交 `8d7cd1f` 单独建立工作目录，获取当时的完整源码和构建说明。
 
 ## 代码阅读
 
