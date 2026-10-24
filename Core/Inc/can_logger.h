@@ -76,8 +76,6 @@ void CanLogger_AddFrame(const CanFrame *frame);
 // 主循环调用：处理归档请求，并约每秒写出缓冲及同步文件。
 void CanLogger_Process(void);
 
-// 返回 1 表示本次运行中的 SD 日志仍可写。
-uint8_t CanLogger_IsReady(void);
 // 暂停前刷出并同步已有记录；暂停期间不计为记录拒收。
 uint8_t CanLogger_SetPaused(uint8_t paused);
 

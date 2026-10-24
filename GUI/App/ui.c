@@ -345,6 +345,19 @@ static void filter_clear_cb(lv_event_t *event)
     refresh_filter(filter);
 }
 
+// 禁用时仅改变文字和边框，覆盖主题的浅色重着色，不创建半透明图层。
+static void style_disabled_control(lv_obj_t *obj)
+{
+    // 当前 LVGL 直接遍历 transition->props，禁用过渡须提供有效的空列表。
+    static const lv_style_prop_t no_transition_props[] = {0};
+    static const lv_style_transition_dsc_t no_transition = {.props = no_transition_props};
+    lv_obj_set_style_recolor_opa(obj, LV_OPA_TRANSP, LV_PART_MAIN | LV_STATE_DISABLED);
+    lv_obj_set_style_text_color(obj, lv_color_hex(0x68717D), LV_PART_MAIN | LV_STATE_DISABLED);
+    lv_obj_set_style_border_color(obj, lv_color_hex(0x292F38), LV_PART_MAIN | LV_STATE_DISABLED);
+    lv_obj_set_style_transition(obj, &no_transition, LV_PART_MAIN);
+    lv_obj_set_style_transition(obj, &no_transition, LV_PART_MAIN | LV_STATE_DISABLED);
+}
+
 static void bind_filter(ui_filter_t *filter, lv_obj_t *input, lv_obj_t *clear,
                         lv_obj_t *table, lv_obj_t *matches)
 {
@@ -352,6 +365,9 @@ static void bind_filter(ui_filter_t *filter, lv_obj_t *input, lv_obj_t *clear,
     filter->table = table;
     filter->matches = matches;
     filter->validity_known = false;
+    style_disabled_control(input);
+    lv_obj_set_style_text_color(input, lv_color_hex(0x68717D),
+        LV_PART_TEXTAREA_PLACEHOLDER | LV_STATE_DISABLED);
     // 输入文字和占位提示是不同的绘制部分，两处都显式指定精简中文字体。
     lv_obj_set_style_text_font(input, &lv_font_cansight_14, LV_PART_MAIN);
     lv_obj_set_style_text_font(input, &lv_font_cansight_14, LV_PART_TEXTAREA_PLACEHOLDER);
@@ -424,12 +440,14 @@ static lv_obj_t *create_button(lv_obj_t *parent, const char *text,
     lv_obj_set_style_border_color(button, lv_color_hex(UI_COLOR_LINE), LV_PART_MAIN);
     lv_obj_set_style_border_width(button, 1, LV_PART_MAIN);
     lv_obj_set_style_radius(button, 6, LV_PART_MAIN);
+    lv_obj_set_style_text_color(button, lv_color_hex(UI_COLOR_TEXT), LV_PART_MAIN);
+    style_disabled_control(button);
 
     //创建按钮文本标签并居中显示
     lv_obj_t *label = lv_label_create(button);
     lv_obj_set_style_text_font(label, &lv_font_cansight_14, LV_PART_MAIN);
     lv_label_set_text(label, text);
-    lv_obj_set_style_text_color(label, lv_color_hex(UI_COLOR_TEXT), LV_PART_MAIN);
+    // 文字继承按钮颜色，随父按钮禁用状态变暗。
     lv_obj_center(label);
     return button;
 }

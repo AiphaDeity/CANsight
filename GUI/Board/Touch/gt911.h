@@ -31,7 +31,6 @@
 void init_gt911(uint16_t slave_addr);
 int gt911_send_data(uint16_t cmd, uint8_t* data, int len);
 int gt911_read_data(uint16_t cmd, uint8_t* data, int len);
-uint8_t gt911_scanning_event(uint8_t mode);
 
 #endif
 

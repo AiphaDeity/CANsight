@@ -509,12 +509,6 @@ void CanLogger_Process(void)
   }
 }
 
-// 返回活动日志的可写状态。
-uint8_t CanLogger_IsReady(void)  
-{
-  return logReady;
-}
-
 uint8_t CanLogger_SetPaused(uint8_t paused)
 {
   if(!paused) {

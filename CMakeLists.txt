@@ -131,9 +131,7 @@ target_sources(${CMAKE_PROJECT_NAME} PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/GUI/Port/lv_port_disp.c
     ${CMAKE_CURRENT_SOURCE_DIR}/GUI/Port/lv_port_indev.c
     ${CMAKE_CURRENT_SOURCE_DIR}/GUI/Board/LCD/lcd.c
-    ${CMAKE_CURRENT_SOURCE_DIR}/GUI/Board/LCD/delay.c
     ${CMAKE_CURRENT_SOURCE_DIR}/GUI/Board/Touch/gt911.c
-    ${CMAKE_CURRENT_SOURCE_DIR}/GUI/Board/Touch/lcd_touch.c
     ${CMAKE_CURRENT_SOURCE_DIR}/GUI/App/ui.c
     ${CMAKE_CURRENT_SOURCE_DIR}/GUI/App/lv_font_cansight_14.c
 )
