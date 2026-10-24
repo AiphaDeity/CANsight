@@ -1,7 +1,5 @@
 #include "can_logger.h"
 #include "can_time.h"
-#include "can_timestamp.h"
-#include "perf_diag.h"
 
 #include "fatfs.h"
 #include "main.h"
@@ -82,28 +80,11 @@ static void CanLogger_StopWithError(const char *stage, FRESULT result)
   }
 }
 
-// 对最长调用耗时保留峰值；低 32 位微秒差值适用于有界的单次文件操作。
-#if CANSIGHT_DETAILED_DIAGNOSTICS
-static void CanLogger_RecordDuration(uint32_t *maximum, uint32_t started)
-{
-  uint32_t elapsed = (uint32_t)CanTimestamp_GetUs() - started;
-  if(elapsed > *maximum) *maximum = elapsed;
-}
-
-#endif
 
 // 同步成功仅表示 FatFs 及底层驱动已完成同步，不保证故障卡的物理持久性。
 static FRESULT CanLogger_SyncFile(void)
 {
-#if CANSIGHT_DETAILED_DIAGNOSTICS
-  uint32_t started = (uint32_t)CanTimestamp_GetUs();
-#endif
-  PerfScope syncScope = PerfDiag_Begin(PERF_SYNC);
   FRESULT result = f_sync(&logFile);
-  PerfDiag_End(syncScope);
-#if CANSIGHT_DETAILED_DIAGNOSTICS
-  CanLogger_RecordDuration(&diagnostics.max_sync_us, started);
-#endif
   if(result == FR_OK) diagnostics.synced_frames = diagnostics.written_frames;
   return result;
 }
@@ -119,15 +100,7 @@ static uint8_t CanLogger_FlushBuffer(void)
     return 1U;  //返回成功
   }
 
-#if CANSIGHT_DETAILED_DIAGNOSTICS
-  uint32_t started = (uint32_t)CanTimestamp_GetUs();
-#endif
-  PerfScope writeScope = PerfDiag_Begin(PERF_WRITE);
   result = f_write(&logFile, logBuffer, logBufferLength, &bytesWritten);
-  PerfDiag_End(writeScope);
-#if CANSIGHT_DETAILED_DIAGNOSTICS
-  CanLogger_RecordDuration(&diagnostics.max_write_us, started);
-#endif
   if ((result != FR_OK) || (bytesWritten != logBufferLength))  //写入失败或写入字节数不符
   {
     CanLogger_StopWithError("write", result == FR_OK ? FR_DISK_ERR : result);
@@ -316,7 +289,7 @@ uint8_t CanLogger_Init(void)
 }
 
 // 先持久化并关闭当前文件，再归档和建立新文件；失败时停止日志并保留原数据。
-static void CanLogger_ArchiveCurrentInternal(void)
+static void CanLogger_ArchiveCurrent(void)
 {
   if(logHasFrames == 0U) {
     archiveState = CAN_ARCHIVE_EMPTY;
@@ -345,20 +318,6 @@ static void CanLogger_ArchiveCurrentInternal(void)
   archiveState = CanLogger_OpenActive() ? CAN_ARCHIVE_DONE : CAN_ARCHIVE_FAILED;
 }
 
-// 归档耗时包含刷出缓冲、同步、关闭、重命名、新建及状态输出。
-static void CanLogger_ArchiveCurrent(void)
-{
-#if CANSIGHT_DETAILED_DIAGNOSTICS
-  uint32_t started = (uint32_t)CanTimestamp_GetUs();
-#endif
-  PerfScope archiveScope = PerfDiag_Begin(PERF_ARCHIVE);
-  CanLogger_ArchiveCurrentInternal();
-  PerfDiag_End(archiveScope);
-#if CANSIGHT_DETAILED_DIAGNOSTICS
-  CanLogger_RecordDuration(&diagnostics.max_archive_us, started);
-#endif
-}
-
 uint8_t CanLogger_RequestArchive(void)
 {
   if(logState == CAN_LOG_PAUSED) return 0U;
@@ -373,8 +332,9 @@ uint8_t CanLogger_RequestArchive(void)
 }
 
 // 把一帧格式化成CSV行并放入RAM缓冲区。
-static void CanLogger_AddFrameInternal(const CanFrame *frame)
+void CanLogger_AddFrame(const CanFrame *frame)
 {
+  if(logState == CAN_LOG_PAUSED) return;
   char row[96];  //一帧报文格式化成的 CSV 行，足够容纳最长的行
   int rowLength;  //格式化后的行长度
   int used;  //已使用的缓冲区字节数
@@ -456,15 +416,6 @@ static void CanLogger_AddFrameInternal(const CanFrame *frame)
   diagnostics.accepted_frames++;
   diagnostics.buffered_frames++;
   logHasFrames = 1U;
-}
-
-// 记录追加包含格式化、复制及控制逻辑；嵌套的文件和等待阶段分别分账。
-void CanLogger_AddFrame(const CanFrame *frame)
-{
-  if(logState == CAN_LOG_PAUSED) return;
-  PerfScope scope = PerfDiag_Begin(PERF_LOGGER);
-  CanLogger_AddFrameInternal(frame);
-  PerfDiag_End(scope);
 }
 
 // 在主循环调用；SD 文件操作不在 CAN 中断中执行。
@@ -551,7 +502,7 @@ CanArchiveState CanLogger_GetArchiveState(void) { return archiveState; }
 const char *CanLogger_GetLastArchiveName(void) { return lastArchiveName; }
 uint32_t CanLogger_GetArchiveRevision(void) { return archiveRevision; }
 
-// 返回按值复制的诊断快照；归档不会重置本次运行的峰值及累计帧数。
+// 返回按值复制的记录计数；归档不清零本次运行的累计值。
 void CanLogger_GetDiagnostics(CanLoggerDiagnostics *snapshot)
 {
   if(snapshot != NULL) *snapshot = diagnostics;

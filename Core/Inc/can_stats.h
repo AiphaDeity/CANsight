@@ -33,11 +33,7 @@ typedef struct {
     uint32_t queue_depth;      // 发布快照时的软件队列占用。
     uint32_t queue_peak;       // 本次启动的软件队列最高占用。
     uint32_t queue_capacity;   // 软件队列实际可用容量。
-    uint32_t max_service_gap_us; // 相邻接收处理批次开始时刻的最长间隔。
-    uint32_t max_batch_us;     // 单次接收批次最长耗时，包含追加日志中的同步写卡。
-    uint32_t max_ui_us;        // LVGL 处理函数最长耗时，包含触摸和显示刷新。
-    uint32_t max_history_us;   // 单次历史文件处理最长耗时，包含查询及删除。
-    CanLoggerDiagnostics logger; // 日志接纳、写入、同步及耗时的独立快照。
+    CanLoggerDiagnostics logger; // 日志接纳、写入、同步的独立快照。
     CanArchiveState archive_state;
     char archive_name[CAN_LOG_ARCHIVE_NAME_SIZE];  // 最近成功归档的文件名。
 } CanStatsRuntime;

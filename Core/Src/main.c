@@ -35,7 +35,6 @@
 #include "can_logger.h"
 #include "can_timestamp.h"
 #include "can_stats.h"
-#include "perf_diag.h"
 #include "log_player.h"
 #include "lv_port_disp.h"
 #include "lv_port_indev.h"
@@ -60,22 +59,14 @@
 #define CAN_UI_RESUME_DEPTH 64U
 #define CAN_HISTORY_INTERVAL_MS 5U
 #define CAN_HISTORY_QUEUE_LIMIT 128U
-// 接收停止且队列排空后输出一次摘要，避免发送期间的周期串口阻塞。
-#define CAN_DIAGNOSTIC_IDLE_MS 1500U
-#if CANSIGHT_DETAILED_DIAGNOSTICS
-#define CAN_SERIAL_BUFFER_SIZE 8192U
-#else
+// 接收静默且队列排空后生成一次摘要，文字通过非阻塞缓冲发送。
+#define CAN_SUMMARY_IDLE_MS 1500U
 #define CAN_SERIAL_BUFFER_SIZE 2048U
-#endif
 #if (CAN_RX_QUEUE_SIZE < 2U) || ((CAN_RX_QUEUE_SIZE & (CAN_RX_QUEUE_SIZE - 1U)) != 0U)
 #error "CAN_RX_QUEUE_SIZE must be a power of two and at least two"
 #endif
 #if CAN_RX_QUEUE_SIZE > 65536U
 #error "CAN RX queue indices require a wider type"
-#endif
-#ifndef CAN_RX_DEBUG_PRINT
-// 逐帧串口诊断输出开关：1 为启用，0 为禁用；默认禁用以降低阻塞开销。
-#define CAN_RX_DEBUG_PRINT 0
 #endif
 
 #define CAN_RX_QUEUE_MASK (CAN_RX_QUEUE_SIZE - 1U) // 掩码，用于循环队列索引
@@ -93,9 +84,6 @@
 // 保存 CAN 接收报文的环形队列
 static CanFrame canRxQueue[CAN_RX_QUEUE_SIZE] __attribute__((section(".ccmram.rx_queue"), aligned(8)));
 static uint8_t canUiDeferred;
-#if CANSIGHT_DETAILED_DIAGNOSTICS
-static uint32_t canUiDeferredLoops;
-#endif
 // printf 仅由主循环使用；发送也在主循环轮询完成，不在 ISR 中调用 printf。
 static uint8_t canSerialBuffer[CAN_SERIAL_BUFFER_SIZE];
 static uint16_t canSerialHead, canSerialTail;
@@ -129,30 +117,6 @@ static volatile uint32_t canRxFifo0OverrunEvents = 0U;
 static volatile uint32_t canHalErrorFlags = 0U;
 static uint8_t canStartupFailed = 0U;  // 初始化、过滤器配置或启动失败标志。
 static volatile uint32_t canRxQueuePeak;  // 由生产者更新，避免读改写竞争。
-#if CANSIGHT_DETAILED_DIAGNOSTICS
-static uint32_t canMaxServiceGapUs;
-static uint32_t canMaxBatchUs;
-static uint32_t canMaxUiUs;
-static uint32_t canMaxHistoryUs;
-// 保存同一次最慢 LVGL 调用内的分项耗时，避免将不同调用的峰值相加。
-static uint32_t canUiPeakLcdUs;
-static uint32_t canUiPeakTouchUs;
-static uint32_t canUiPeakOtherUs;
-static uint32_t canUiPeakFlushes;
-static uint32_t canUiPeakPixels;
-static uint32_t canUiPeakRefreshUs;
-static uint32_t canUiPeakRenderUs;
-static uint32_t canUiPeakRenderCpuUs;
-static uint32_t canUiPeakRefreshOtherUs;
-static uint32_t canUiPeakStatsUs;
-static uint32_t canUiPeakHandlerOtherUs;
-static uint32_t canUiPeakInvalidRequests;
-static uint32_t canUiPeakInvalidPixels;
-static uint32_t canUiCalls;
-static uint64_t canUiTotalUs;
-// 固定耗时区间，不保存逐次样本；各项互斥，均统计完整 LVGL 调用。
-static uint32_t canUiHistogram[6];
-#endif
 
 /* USER CODE END PV */
 
@@ -166,14 +130,11 @@ void SystemClock_Config(void);
 /* USER CODE BEGIN 0 */
 
 // 只读队列快照供主循环诊断使用，不改变生产者和消费者索引。
-static uint32_t CAN_DiagnosticQueueDepth(void)
+static uint32_t CAN_RxQueue_Depth(void)
 {
   return ((uint32_t)canRxQueueHead - canRxQueueTail) & CAN_RX_QUEUE_MASK;
 }
 
-#if CANSIGHT_DETAILED_DIAGNOSTICS
-static uint32_t CAN_DiagnosticQueueLost(void) { return canRxQueueOverflow; }
-#endif
 
 /**
  * @brief 将控制器状态、日志状态及接收异常计数发布至界面数据层。
@@ -207,12 +168,6 @@ static void CAN_PublishRuntime(void)
   runtime.queue_depth = ((uint32_t)canRxQueueHead - canRxQueueTail) & CAN_RX_QUEUE_MASK;
   runtime.queue_peak = canRxQueuePeak;
   runtime.queue_capacity = CAN_RX_QUEUE_SIZE - 1U;
-#if CANSIGHT_DETAILED_DIAGNOSTICS
-  runtime.max_service_gap_us = canMaxServiceGapUs;
-  runtime.max_batch_us = canMaxBatchUs;
-  runtime.max_ui_us = canMaxUiUs;
-  runtime.max_history_us = canMaxHistoryUs;
-#endif
   CanLogger_GetDiagnostics(&runtime.logger);
   runtime.archive_state = CanLogger_GetArchiveState();
   snprintf(runtime.archive_name, sizeof(runtime.archive_name), "%s",
@@ -220,74 +175,11 @@ static void CAN_PublishRuntime(void)
   CanStats_SetRuntime(&runtime);
 }
 
-// 仅由主循环在接收静默后调用，所有耗时峰值均取打印之前的快照。
-#if CANSIGHT_DETAILED_DIAGNOSTICS
-static void CAN_PrintPerformance(void)
-{
-  PerfDiag_Pause();
-  CanLoggerDiagnostics log;
-  LvPortIndevMetrics touch;
-  UiDiagnostics widgets;
-  LvPortInvalidArea areas[LV_PORT_INVALID_AREA_LIMIT];
-  CanLogger_GetDiagnostics(&log);
-  ui_get_diagnostics(&widgets);
-  lv_port_indev_get_metrics(&touch);
-  printf("CAN PERF: fifo=%lu processed=%lu queue_lost=%lu fifo_overruns=%lu peak=%lu/%lu\r\n",
-         (unsigned long)canRxFramesReadFromFifo,
-         (unsigned long)CanStats_GetTotalCount(), (unsigned long)canRxQueueOverflow,
-         (unsigned long)canRxFifo0OverrunEvents, (unsigned long)canRxQueuePeak,
-         (unsigned long)(CAN_RX_QUEUE_SIZE - 1U));
-  printf("CAN SERIAL: dropped_chars=%lu\r\n", (unsigned long)canSerialDropped);
-  printf("CAN PERF us: gap=%lu batch=%lu ui=%lu history=%lu write=%lu sync=%lu archive=%lu\r\n",
-         (unsigned long)canMaxServiceGapUs, (unsigned long)canMaxBatchUs,
-         (unsigned long)canMaxUiUs, (unsigned long)canMaxHistoryUs,
-         (unsigned long)log.max_write_us, (unsigned long)log.max_sync_us,
-         (unsigned long)log.max_archive_us);
-  printf("CAN UI scheduling: deferred_loops=%lu pause_depth=%u resume_depth=%u\r\n",
-         (unsigned long)canUiDeferredLoops, (unsigned)CAN_UI_PAUSE_DEPTH, (unsigned)CAN_UI_RESUME_DEPTH);
-  printf("CAN UI peak: total_us=%lu lcd_us=%lu touch_us=%lu other_us=%lu flushes=%lu pixels=%lu\r\n",
-         (unsigned long)canMaxUiUs, (unsigned long)canUiPeakLcdUs,
-         (unsigned long)canUiPeakTouchUs, (unsigned long)canUiPeakOtherUs,
-         (unsigned long)canUiPeakFlushes, (unsigned long)canUiPeakPixels);
-  printf("CAN UI stages us: refresh=%lu render=%lu render_cpu=%lu refresh_other=%lu stats=%lu handler_other=%lu\r\n",
-         (unsigned long)canUiPeakRefreshUs, (unsigned long)canUiPeakRenderUs,
-         (unsigned long)canUiPeakRenderCpuUs, (unsigned long)canUiPeakRefreshOtherUs,
-         (unsigned long)canUiPeakStatsUs, (unsigned long)canUiPeakHandlerOtherUs);
-  printf("CAN UI invalid: requests=%lu request_pixels=%lu (may overlap; same peak call)\r\n",
-         (unsigned long)canUiPeakInvalidRequests, (unsigned long)canUiPeakInvalidPixels);
-  printf("CAN UI stats: freeze=%lu freeze_rx_metrics=%lu calls=%lu max_us=%lu handler_calls=%lu handler_avg_us=%lu\r\n",
-         (unsigned long)widgets.frozen, (unsigned long)widgets.frozen_rx_metrics,
-         (unsigned long)widgets.stats_calls,
-         (unsigned long)widgets.max_stats_us, (unsigned long)canUiCalls,
-         (unsigned long)(canUiCalls ? canUiTotalUs / canUiCalls : 0U));
-  printf("CAN UI hist: lt1ms=%lu 1to5ms=%lu 5to20ms=%lu 20to50ms=%lu 50to100ms=%lu ge100ms=%lu\r\n",
-         (unsigned long)canUiHistogram[0], (unsigned long)canUiHistogram[1],
-         (unsigned long)canUiHistogram[2], (unsigned long)canUiHistogram[3],
-         (unsigned long)canUiHistogram[4], (unsigned long)canUiHistogram[5]);
-  uint32_t areaCount = lv_port_disp_get_invalid_areas(areas, LV_PORT_INVALID_AREA_LIMIT);
-  for(uint32_t i = 0U; i < areaCount; i++) {
-    printf("CAN UI area: x1=%ld y1=%ld x2=%ld y2=%ld pixels=%lu hits=%lu\r\n",
-           (long)areas[i].area.x1, (long)areas[i].area.y1,
-           (long)areas[i].area.x2, (long)areas[i].area.y2,
-           (unsigned long)areas[i].pixels, (unsigned long)areas[i].hits);
-  }
-  printf("CAN TOUCH: callbacks=%lu max_us=%lu io_errors=%lu\r\n",
-         (unsigned long)touch.callbacks, (unsigned long)touch.max_read_us,
-         (unsigned long)touch.io_errors);
-  printf("CAN LOG: accepted=%lu written=%lu synced=%lu buffered=%lu rejected=%lu\r\n",
-         (unsigned long)log.accepted_frames, (unsigned long)log.written_frames,
-         (unsigned long)log.synced_frames, (unsigned long)log.buffered_frames,
-         (unsigned long)log.rejected_frames);
-  PerfDiag_Print();
-}
-
-#else
-static void CAN_PrintPerformance(void)
+// 仅由主循环在接收静默后调用，汇总接收、记录和错误计数。
+static void CAN_PrintSummary(void)
 {
   CanLoggerDiagnostics log;
-  LvPortIndevMetrics touch;
   CanLogger_GetDiagnostics(&log);
-  lv_port_indev_get_metrics(&touch);
   printf("CAN: fifo=%lu processed=%lu lost=%lu overruns=%lu peak=%lu/%lu\r\n",
          (unsigned long)canRxFramesReadFromFifo, (unsigned long)CanStats_GetTotalCount(),
          (unsigned long)canRxQueueOverflow, (unsigned long)canRxFifo0OverrunEvents,
@@ -298,10 +190,9 @@ static void CAN_PrintPerformance(void)
          (unsigned long)log.rejected_frames);
   printf("ERROR: can=0x%08lX sd=%lu touch=%lu serial_dropped=%lu\r\n",
          (unsigned long)canHalErrorFlags, (unsigned long)CanLogger_GetLastError(),
-         (unsigned long)touch.io_errors, (unsigned long)canSerialDropped);
+         (unsigned long)lv_port_indev_get_io_errors(), (unsigned long)canSerialDropped);
 }
 
-#endif
 
 // 界面回调仅提交请求，不在 LVGL 事件中直接访问文件系统。
 static void CAN_RequestArchive(void)
@@ -323,8 +214,6 @@ static uint8_t CAN_RxQueue_PushFromISR(const CanFrame *frame) {
   // 检查队列是否已满
   if (nextHead == canRxQueueTail) {
     // 队列已满，无法入队
-    PerfDiag_RecordLossFromISR((uint32_t)frame->timestamp_us,
-                              CAN_RX_QUEUE_SIZE - 1U, canRxFramesReadFromFifo);
     canRxQueueOverflow++;
     return 0U; // 入队失败
   }
@@ -443,12 +332,7 @@ int main(void)
   CAN_PublishRuntime();
   lv_timer_handler();
   lv_refr_now(NULL);
-  lv_port_disp_reset_metrics();
-  ui_reset_diagnostics();
-  printf("CAN UI: diagnostics=%u; freeze_stats=%u; freeze_rx_metrics=%u; period=500ms\r\n",
-         (unsigned)CANSIGHT_DETAILED_DIAGNOSTICS,
-         (unsigned)UI_DIAG_FREEZE_STATS, (unsigned)UI_DIAG_FREEZE_RX_METRICS);
-  PerfDiag_Reset(CAN_DiagnosticQueueDepth, CAN_DiagnosticQueueLost);
+  printf("CAN UI: period=500ms\r\n");
 
 
   // CAN1过滤器配置，ID和Mask都设为0，表示接收所有符合格式的报文。
@@ -493,15 +377,12 @@ int main(void)
 
   CAN_PublishRuntime();
 
-  // 运行阶段的耗时统计从 CAN 启动后开始，排除硬件及文件系统初始化。
-#if CANSIGHT_DETAILED_DIAGNOSTICS
-  uint32_t lastServiceUs = (uint32_t)CanTimestamp_GetUs();
-#endif
+  // CAN 启动后初始化界面、历史浏览及摘要调度。
   uint32_t lastUiTick = HAL_GetTick() - CAN_UI_INTERVAL_MS;
   uint32_t lastHistoryTick = HAL_GetTick() - CAN_HISTORY_INTERVAL_MS;
   uint32_t observedFifoCount = 0U;
   uint32_t lastReceiveTick = HAL_GetTick();
-  uint8_t performancePending = 0U;
+  uint8_t summaryPending = 0U;
 
   /* USER CODE END 2 */
 
@@ -518,14 +399,7 @@ int main(void)
     LogPlayer_ReplayProcess();
 
     // 优先消费接收队列；时间预算只在完整报文之间检查，不中断文件操作。
-    PerfDiag_SampleQueue(CAN_DiagnosticQueueDepth(), canRxFramesReadFromFifo, HAL_GetTick());
-    PerfScope batchScope = PerfDiag_Begin(PERF_RX_BATCH);
     uint32_t batchStarted = (uint32_t)CanTimestamp_GetUs();
-#if CANSIGHT_DETAILED_DIAGNOSTICS
-    uint32_t serviceGap = batchStarted - lastServiceUs;
-    lastServiceUs = batchStarted;
-    if(serviceGap > canMaxServiceGapUs) canMaxServiceGapUs = serviceGap;
-#endif
     CanFrame frame;
 
     // 队列为空或达到处理上限后结束本批次，剩余报文留待下一轮处理。
@@ -535,112 +409,30 @@ int main(void)
       // 只在主循环里写日志；CAN 中断只负责接收并把数据放入队列。
       CanLogger_AddFrame(&frame);
       // 统计处理独立于日志可写状态及界面筛选条件。
-      PerfScope statsScope = PerfDiag_Begin(PERF_STATS);
       CanStats_AddFrame(&frame);
-      PerfDiag_End(statsScope);
 
-#if CAN_RX_DEBUG_PRINT
-      const char *frameType = (frame.ide == CAN_ID_STD) ? "STD" : "EXT";
-      const char *frameRTR = (frame.rtr == CAN_RTR_DATA) ? "DATA" : "REMOTE";
-
-      // 打印帧格式、类型、ID、DLC
-      printf("CAN1 RX: %s %s ID:0x%lX DLC:%u Data:", frameType, frameRTR,
-             (unsigned long)frame.id, (unsigned int)frame.dlc);
-
-      //远程数据帧没有数据字节，只有数据帧打印
-      if (frame.rtr == CAN_RTR_DATA) 
-      {
-        for (uint8_t i = 0U; i < frame.dlc; i++) 
-        {
-          printf(" %02X", (unsigned int)frame.data[i]);
-        }
-      }
-
-      printf("\r\n");
-#endif
       if((uint32_t)CanTimestamp_GetUs() - batchStarted >= CAN_RX_BATCH_BUDGET_US) break;
     }
-#if CANSIGHT_DETAILED_DIAGNOSTICS
-    uint32_t elapsed = (uint32_t)CanTimestamp_GetUs() - batchStarted;
-    if(elapsed > canMaxBatchUs) canMaxBatchUs = elapsed;
-#endif
-    PerfDiag_End(batchScope);
 
     // 定期把缓冲记录同步到卡；不在 CAN 中断里调用 FatFs。
-    PerfScope processScope = PerfDiag_Begin(PERF_LOG_PROCESS);
     CanLogger_Process();
-    PerfDiag_End(processScope);
     LogPlayer_ReplayProcess();
 
     // 界面按时间调度，持续来帧时仍保留输入及状态刷新的执行机会。
-    uint32_t uiQueueDepth = CAN_DiagnosticQueueDepth();
+    uint32_t uiQueueDepth = CAN_RxQueue_Depth();
     if(uiQueueDepth >= CAN_UI_PAUSE_DEPTH) canUiDeferred = 1U;
     else if(uiQueueDepth <= CAN_UI_RESUME_DEPTH) canUiDeferred = 0U;
-#if CANSIGHT_DETAILED_DIAGNOSTICS
-    if(canUiDeferred) canUiDeferredLoops++;
-#endif
     if(!canUiDeferred && HAL_GetTick() - lastUiTick >= CAN_UI_INTERVAL_MS) {
-      PerfScope uiScope = PerfDiag_Begin(PERF_UI);
       CAN_PublishRuntime();
-#if CANSIGHT_DETAILED_DIAGNOSTICS
-      LvPortDispMetrics displayBefore, displayAfter;
-      LvPortIndevMetrics touchBefore, touchAfter;
-      UiDiagnostics statsBefore, statsAfter;
-      lv_port_disp_get_metrics(&displayBefore);
-      ui_get_diagnostics(&statsBefore);
-      lv_port_indev_get_metrics(&touchBefore);
-      uint32_t started = (uint32_t)CanTimestamp_GetUs();
-#endif
       lv_timer_handler();
-#if CANSIGHT_DETAILED_DIAGNOSTICS
-      elapsed = (uint32_t)CanTimestamp_GetUs() - started;
-      lv_port_disp_get_metrics(&displayAfter);
-      lv_port_indev_get_metrics(&touchAfter);
-      ui_get_diagnostics(&statsAfter);
-      canUiCalls++;
-      canUiTotalUs += elapsed;
-      uint32_t bucket = elapsed < 1000U ? 0U : elapsed < 5000U ? 1U :
-                        elapsed < 20000U ? 2U : elapsed < 50000U ? 3U :
-                        elapsed < 100000U ? 4U : 5U;
-      canUiHistogram[bucket]++;
-      if(elapsed > canMaxUiUs) {
-        canMaxUiUs = elapsed;
-        canUiPeakLcdUs = displayAfter.flush_us - displayBefore.flush_us;
-        canUiPeakTouchUs = touchAfter.read_us - touchBefore.read_us;
-        uint32_t measured = canUiPeakLcdUs + canUiPeakTouchUs;
-        canUiPeakOtherUs = elapsed > measured ? elapsed - measured : 0U;
-        canUiPeakFlushes = displayAfter.flush_calls - displayBefore.flush_calls;
-        canUiPeakPixels = displayAfter.pixels - displayBefore.pixels;
-        canUiPeakRefreshUs = displayAfter.refresh_us - displayBefore.refresh_us;
-        canUiPeakRenderUs = displayAfter.render_us - displayBefore.render_us;
-        canUiPeakRenderCpuUs = displayAfter.render_cpu_us - displayBefore.render_cpu_us;
-        canUiPeakRefreshOtherUs = canUiPeakRefreshUs > canUiPeakRenderUs ?
-                                 canUiPeakRefreshUs - canUiPeakRenderUs : 0U;
-        canUiPeakStatsUs = statsAfter.stats_us - statsBefore.stats_us;
-        measured = canUiPeakRefreshUs + canUiPeakTouchUs + canUiPeakStatsUs;
-        canUiPeakHandlerOtherUs = elapsed > measured ? elapsed - measured : 0U;
-        canUiPeakInvalidRequests = displayAfter.invalid_requests - displayBefore.invalid_requests;
-        canUiPeakInvalidPixels = displayAfter.invalid_pixels - displayBefore.invalid_pixels;
-      }
-#endif
-      PerfDiag_End(uiScope);
       lastUiTick = HAL_GetTick();
     }
 
-    // 接收积压较多时延后历史访问；单次同步文件操作仍需由耗时统计评估。
+    // 接收积压较多时延后历史访问，优先处理收到的报文。
     uint32_t queued = ((uint32_t)canRxQueueHead - canRxQueueTail) & CAN_RX_QUEUE_MASK;
     if(queued <= CAN_HISTORY_QUEUE_LIMIT &&
        HAL_GetTick() - lastHistoryTick >= CAN_HISTORY_INTERVAL_MS) {
-#if CANSIGHT_DETAILED_DIAGNOSTICS
-      uint32_t started = (uint32_t)CanTimestamp_GetUs();
-#endif
-      PerfScope historyScope = PerfDiag_Begin(PERF_HISTORY);
       LogPlayer_Process();
-      PerfDiag_End(historyScope);
-#if CANSIGHT_DETAILED_DIAGNOSTICS
-      elapsed = (uint32_t)CanTimestamp_GetUs() - started;
-      if(elapsed > canMaxHistoryUs) canMaxHistoryUs = elapsed;
-#endif
       lastHistoryTick = HAL_GetTick();
     }
 
@@ -649,25 +441,20 @@ int main(void)
     if(fifoCount != observedFifoCount) {
       observedFifoCount = fifoCount;
       lastReceiveTick = HAL_GetTick();
-      performancePending = 1U;
+      summaryPending = 1U;
     }
-    else if(performancePending && !LogPlayer_ReplayBusy() && canRxQueueHead == canRxQueueTail &&
+    else if(summaryPending && !LogPlayer_ReplayBusy() && canRxQueueHead == canRxQueueTail &&
             canSerialHead == canSerialTail &&
-            HAL_GetTick() - lastReceiveTick >= CAN_DIAGNOSTIC_IDLE_MS) {
-      performancePending = 0U;
-      CAN_PrintPerformance();
+            HAL_GetTick() - lastReceiveTick >= CAN_SUMMARY_IDLE_MS) {
+      summaryPending = 0U;
+      CAN_PrintSummary();
       // 摘要仅格式化入队；串口逐字节发送期间仍正常处理接收。
-#if CANSIGHT_DETAILED_DIAGNOSTICS
-      lastServiceUs = (uint32_t)CanTimestamp_GetUs();
-#endif
     }
 
     // 仅在没有接收积压时短暂让出 CPU；有积压立即进入下一批处理。
     CAN_ServiceSerial();
     if(canRxQueueHead == canRxQueueTail && !LogPlayer_ReplayBusy() && canSerialHead == canSerialTail) {
-      PerfScope idleScope = PerfDiag_Begin(PERF_IDLE);
       HAL_Delay(1);
-      PerfDiag_End(idleScope);
     }
   }
   /* USER CODE END 3 */

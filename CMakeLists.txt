@@ -55,11 +55,6 @@ set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${cansight_gener
 # Create an executable object type
 add_executable(${CMAKE_PROJECT_NAME})
 
-option(CANSIGHT_DETAILED_DIAGNOSTICS "Enable detailed timing, UI metrics and verbose serial reports" OFF)
-target_compile_definitions(${CMAKE_PROJECT_NAME} PRIVATE
-    CANSIGHT_DETAILED_DIAGNOSTICS=$<BOOL:${CANSIGHT_DETAILED_DIAGNOSTICS}>)
-message(STATUS "Detailed diagnostics: ${CANSIGHT_DETAILED_DIAGNOSTICS}")
-
 # Add STM32CubeMX generated sources
 add_subdirectory(cmake/stm32cubemx)
 
@@ -115,10 +110,6 @@ if(CANSIGHT_RX_LOG_DEBUG_O2)
 endif()
 message(STATUS "CAN RX/log Debug -O2: ${CANSIGHT_RX_LOG_DEBUG_O2}")
 
-# 高频计时边界单独优化，减轻观测开销，不改变被测业务模块的优化开关。
-set_property(SOURCE "${CMAKE_CURRENT_SOURCE_DIR}/Core/Src/perf_diag.c"
-    APPEND PROPERTY COMPILE_OPTIONS "$<$<COMPILE_LANG_AND_ID:C,GNU>:-O2>")
-
 # Link directories setup
 target_link_directories(${CMAKE_PROJECT_NAME} PRIVATE
     # Add user defined library search paths
@@ -129,7 +120,6 @@ target_sources(${CMAKE_PROJECT_NAME} PRIVATE
     # Add user sources here
     ${CMAKE_CURRENT_SOURCE_DIR}/Core/Src/can_logger.c
     ${CMAKE_CURRENT_SOURCE_DIR}/Core/Src/sd_diskio_dma.c
-    ${CMAKE_CURRENT_SOURCE_DIR}/Core/Src/perf_diag.c
     ${CMAKE_CURRENT_SOURCE_DIR}/Core/Src/can_stats.c
     ${CMAKE_CURRENT_SOURCE_DIR}/Core/Src/can_timestamp.c
     ${CMAKE_CURRENT_SOURCE_DIR}/Core/Src/log_player.c
