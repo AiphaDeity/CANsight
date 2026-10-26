@@ -375,11 +375,8 @@ static void style_data_table(lv_obj_t *table)
 // 创建了标签控件并设置属性
 static lv_obj_t *create_label(lv_obj_t *parent, const char *text,
                               lv_coord_t x, lv_coord_t y, lv_coord_t width,
-                              lv_color_t color, uint32_t font_size)
+                              lv_color_t color)
 {
-    // 消除未使用参数警告
-    (void)font_size;
-    
     // 创建标签并设置文本内容和位置
     lv_obj_t *label = lv_label_create(parent);
     lv_label_set_text(label, text);
@@ -819,9 +816,9 @@ static void history_delete_cb(lv_event_t *event)
     lv_obj_set_style_bg_color(panel, lv_color_hex(UI_COLOR_PANEL), LV_PART_MAIN);
     lv_obj_set_style_border_color(panel, lv_color_hex(UI_COLOR_LINE), LV_PART_MAIN);
     lv_obj_set_scroll_dir(panel, LV_DIR_NONE);
-    create_label(panel, "Delete history file?", 20, 18, 400, lv_color_hex(UI_COLOR_TEXT), 0);
-    create_label(panel, delete_target, 20, 52, 400, lv_color_hex(UI_COLOR_TEXT), 0);
-    create_label(panel, "This cannot be undone.", 20, 86, 400, lv_color_hex(0xE3B34E), 0);
+    create_label(panel, "Delete history file?", 20, 18, 400, lv_color_hex(UI_COLOR_TEXT));
+    create_label(panel, delete_target, 20, 52, 400, lv_color_hex(UI_COLOR_TEXT));
+    create_label(panel, "This cannot be undone.", 20, 86, 400, lv_color_hex(0xE3B34E));
     lv_obj_t *cancel = create_button(panel, "Cancel", 20, 142, 185, 42, false);
     lv_obj_t *confirm = create_button(panel, "Delete", 230, 142, 185, 42, false);
     lv_obj_set_style_bg_color(confirm, lv_color_hex(0xA83F3F), LV_PART_MAIN);
@@ -925,13 +922,13 @@ static void create_status_bar(lv_obj_t *screen)
     lv_obj_set_style_pad_all(bar, 0, LV_PART_MAIN);
 
     //添加状态栏各状态标签
-    create_label(bar, "CanSight", 16, 12, 100, lv_color_hex(UI_COLOR_TEXT), 18);
+    create_label(bar, "CanSight", 16, 12, 100, lv_color_hex(UI_COLOR_TEXT));
     can_status_label = create_label(bar, "● CAN1 未启动", 150, 13, 150,
-                                   lv_color_hex(UI_COLOR_MUTED), 0);
-    create_label(bar, "1 Mbit/s", 325, 13, 110, lv_color_hex(UI_COLOR_TEXT), 0);
+                                   lv_color_hex(UI_COLOR_MUTED));
+    create_label(bar, "1 Mbit/s", 325, 13, 110, lv_color_hex(UI_COLOR_TEXT));
     sd_status_label = create_label(bar, "● SD 未挂载", 475, 13, 150,
-                                  lv_color_hex(UI_COLOR_MUTED), 0);
-    total_label = create_label(bar, "总帧数 0", 630, 13, 165, lv_color_hex(UI_COLOR_TEXT), 0);
+                                  lv_color_hex(UI_COLOR_MUTED));
+    total_label = create_label(bar, "总帧数 0", 630, 13, 165, lv_color_hex(UI_COLOR_TEXT));
 }
 
 // 处理接收页分页事件。
@@ -961,7 +958,7 @@ static void create_receive_page(lv_obj_t *screen)
     lv_obj_set_style_pad_all(receive_page, 0, LV_PART_MAIN);
 
     //筛选区域：ID 输入框、清除按钮、匹配统计
-    create_label(receive_page, "ID (hex)", 16, 9, 70, lv_color_hex(UI_COLOR_MUTED), 0);
+    create_label(receive_page, "ID (hex)", 16, 9, 70, lv_color_hex(UI_COLOR_MUTED));
     lv_obj_t *filter = lv_textarea_create(receive_page);
     lv_obj_set_pos(filter, 92, 0);
     lv_obj_set_size(filter, 170, 36);
@@ -975,7 +972,7 @@ static void create_receive_page(lv_obj_t *screen)
     lv_obj_add_event_cb(previous, receive_page_cb, LV_EVENT_CLICKED, NULL);
     lv_obj_add_event_cb(next, receive_page_cb, LV_EVENT_CLICKED, &receive_offset);
     lv_obj_t *matches = create_label(receive_page, "", 442, 9, 345,
-                 lv_color_hex(UI_COLOR_MUTED), 0);
+                 lv_color_hex(UI_COLOR_MUTED));
 
     // 启动时预分配表头和八个显示位置，接收期间仅更新现有单元格。
     lv_obj_t *table = lv_table_create(receive_page);
@@ -1028,7 +1025,7 @@ static void create_playback_page(lv_obj_t *screen)
     lv_obj_set_style_bg_opa(playback_page, LV_OPA_TRANSP, LV_PART_MAIN);
     lv_obj_set_style_border_width(playback_page, 0, LV_PART_MAIN);
     lv_obj_set_style_pad_all(playback_page, 0, LV_PART_MAIN);
-    create_label(playback_page, "SD 日志文件", 16, 0, 180, lv_color_hex(UI_COLOR_MUTED), 0);
+    create_label(playback_page, "SD 日志文件", 16, 0, 180, lv_color_hex(UI_COLOR_MUTED));
 
     lv_obj_t *panel = lv_obj_create(playback_page);
     lv_obj_set_pos(panel, 8, 26);
@@ -1037,7 +1034,7 @@ static void create_playback_page(lv_obj_t *screen)
     lv_obj_set_style_border_color(panel, lv_color_hex(UI_COLOR_LINE), LV_PART_MAIN);
     lv_obj_set_style_pad_all(panel, 6, LV_PART_MAIN);
     lv_obj_set_scroll_dir(panel, LV_DIR_VER);
-    list_status_label = create_label(panel, "", 4, 0, 168, lv_color_hex(UI_COLOR_MUTED), 0);
+    list_status_label = create_label(panel, "", 4, 0, 168, lv_color_hex(UI_COLOR_MUTED));
     lv_label_set_long_mode(list_status_label, LV_LABEL_LONG_MODE_DOTS);
     lv_obj_set_height(list_status_label, 18);
     for(unsigned i = 0; i < LOG_PLAYER_PAGE_SIZE; i++) {
@@ -1051,7 +1048,7 @@ static void create_playback_page(lv_obj_t *screen)
     }
     list_previous = create_button(panel, "<", 4, 165, 36, 28, false);
     list_next = create_button(panel, ">", 132, 165, 36, 28, false);
-    list_page_label = create_label(panel, "", 48, 171, 80, lv_color_hex(UI_COLOR_MUTED), 0);
+    list_page_label = create_label(panel, "", 48, 171, 80, lv_color_hex(UI_COLOR_MUTED));
     lv_obj_add_event_cb(list_previous, history_page_cb, LV_EVENT_CLICKED, (void *)(intptr_t)-1);
     lv_obj_add_event_cb(list_next, history_page_cb, LV_EVENT_CLICKED, (void *)(intptr_t)1);
     lv_obj_t *refresh = create_button(panel, "Refresh", 4, 201, 168, 32, false);
@@ -1068,9 +1065,9 @@ static void create_playback_page(lv_obj_t *screen)
     lv_obj_add_event_cb(replay_start_button, replay_event_cb, LV_EVENT_CLICKED, (void *)(intptr_t)0);
     lv_obj_add_event_cb(replay_pause_button, replay_event_cb, LV_EVENT_CLICKED, (void *)(intptr_t)1);
     lv_obj_add_event_cb(replay_stop_button, replay_event_cb, LV_EVENT_CLICKED, (void *)(intptr_t)2);
-    preview_status_label = create_label(playback_page, "", 216, 50, 570, lv_color_hex(UI_COLOR_MUTED), 0);
-    storage_label = create_label(playback_page, "", 216, 27, 570, lv_color_hex(UI_COLOR_MUTED), 0);
-    create_label(playback_page, "ID", 216, 87, 26, lv_color_hex(UI_COLOR_MUTED), 0);
+    preview_status_label = create_label(playback_page, "", 216, 50, 570, lv_color_hex(UI_COLOR_MUTED));
+    storage_label = create_label(playback_page, "", 216, 27, 570, lv_color_hex(UI_COLOR_MUTED));
+    create_label(playback_page, "ID", 216, 87, 26, lv_color_hex(UI_COLOR_MUTED));
     lv_obj_t *filter = lv_textarea_create(playback_page);
     lv_obj_set_pos(filter, 246, 80);
     lv_obj_set_size(filter, 156, 32);
@@ -1088,7 +1085,7 @@ static void create_playback_page(lv_obj_t *screen)
     frame_next = create_button(playback_page, "Next frame", 334, 116, 110, 30, false);
     lv_obj_add_event_cb(frame_previous, history_step_cb, LV_EVENT_CLICKED, (void *)(intptr_t)-1);
     lv_obj_add_event_cb(frame_next, history_step_cb, LV_EVENT_CLICKED, (void *)(intptr_t)1);
-    preview_count_label = create_label(playback_page, "", 454, 123, 332, lv_color_hex(UI_COLOR_MUTED), 0);
+    preview_count_label = create_label(playback_page, "", 454, 123, 332, lv_color_hex(UI_COLOR_MUTED));
     lv_label_set_long_mode(preview_count_label, LV_LABEL_LONG_MODE_DOTS);
     lv_label_set_long_mode(preview_status_label, LV_LABEL_LONG_MODE_DOTS);
 
@@ -1127,9 +1124,9 @@ void ui_init(void)
     //创建顶部状态栏，显示应用名称和CAN总线状态信息 
     create_status_bar(screen);
     capacity_label = create_label(screen, "", 16, 100, 770,
-                                  lv_color_hex(0xE3B34E), 0);
+                                  lv_color_hex(0xE3B34E));
     diagnostics_label = create_label(screen, "", 342, 64, 444,
-                                     lv_color_hex(0xE3B34E), 0);
+                                     lv_color_hex(0xE3B34E));
     runtime_display_valid = false;
     displayed_total = UINT32_MAX;  // 保证启动时累计帧数为 0 仍执行首次刷新。
 

@@ -1,11 +1,25 @@
 #include "log_player.h"
+#include "can.h"
+#include "can_timestamp.h"
+#include "fatfs.h"
 
 #include <ctype.h>
 #include <stdio.h>
 #include <string.h>
 
+#define LOG_INDEX_CAPACITY 64U
+#define REPLAY_CAPACITY 64U
+
+// 索引保存行起点之前的完整解析状态，跳转后能恢复全局帧号和旧日志回绕上下文。
+typedef struct {
+    uint64_t previous_time;
+    uint32_t offset;
+    uint32_t line_number;
+    uint32_t frames;
+    uint32_t matches;
+} LogCursor;
+
 // 读取流程：界面提交请求，主循环分批访问文件系统，结果通过 view 提供给界面。
-#include "fatfs.h"
 static FIL reader;                          // 历史文件对象，与日志模块的写入对象独立。
 static DIR directory;                       // 分批扫描期间持续保留的目录对象。
 static uint32_t archive_revision;           // 上次观察到的归档版本，用于检测新增历史文件。
@@ -32,17 +46,6 @@ static LogHistoryFile candidates[LOG_PLAYER_PAGE_SIZE];  // 当前查询保留�
 static uint8_t candidate_count;             // 候选数组中的有效条目数。
 static uint32_t scan_total;                 // 本次扫描发现的全部有效历史文件数。
 
-#define LOG_INDEX_CAPACITY 64U
-
-// 索引保存行起点之前的完整解析状态，跳转后能恢复全局帧号和旧日志回绕上下文。
-typedef struct {
-    uint64_t previous_time;
-    uint32_t offset;
-    uint32_t line_number;
-    uint32_t frames;
-    uint32_t matches;
-} LogCursor;
-
 static LogCursor cursor;
 static LogCursor checkpoints[LOG_INDEX_CAPACITY];
 static uint8_t checkpoint_count;
@@ -51,6 +54,20 @@ static uint32_t line_offset;                // 正在拼接的文本行在文件
 static uint8_t building_index;
 static uint8_t read_turn;                   // 目录与文件同时打开时交替推进，防止翻页长期等待。
 static uint8_t release_pending;             // 快速退出再进入历史页时，也须释放上一轮读取资源。
+
+static FIL replay_file;
+static uint8_t replay_open, replay_eof, replay_header, replay_legacy;
+static uint8_t replay_inflight, replay_pause_requested;
+static uint8_t replay_have_previous;
+static uint16_t replay_head, replay_count, replay_bytes, replay_pos, replay_line_used;
+static uint8_t replay_chunk[2048];
+static char replay_line[128];
+static CanFrame replay_frames[REPLAY_CAPACITY];
+static uint64_t replay_previous, replay_first, replay_base, replay_pause_time;
+static uint64_t replay_submitted, replay_stop_time;
+static uint32_t replay_mailbox;
+static LogReplayState replay_final;
+static uint8_t replay_stop_initialized;
 
 // 重建时立即清除旧结果，避免筛选条件与旧文件窗口混合显示。
 static void reset_browser(void)
@@ -771,24 +788,6 @@ uint8_t LogPlayer_ReplayBusy(void)
            replay.state == LOG_REPLAY_PAUSED || replay.state == LOG_REPLAY_STOPPING ||
            replay.state == LOG_REPLAY_STOP_FAILED;
 }
-
-#include "can.h"
-#include "can_timestamp.h"
-
-#define REPLAY_CAPACITY 64U
-static FIL replay_file;
-static uint8_t replay_open, replay_eof, replay_header, replay_legacy;
-static uint8_t replay_inflight, replay_pause_requested;
-static uint8_t replay_have_previous;
-static uint16_t replay_head, replay_count, replay_bytes, replay_pos, replay_line_used;
-static uint8_t replay_chunk[2048];
-static char replay_line[128];
-static CanFrame replay_frames[REPLAY_CAPACITY];
-static uint64_t replay_previous, replay_first, replay_base, replay_pause_time;
-static uint64_t replay_submitted, replay_stop_time;
-static uint32_t replay_mailbox;
-static LogReplayState replay_final;
-static uint8_t replay_stop_initialized;
 
 // 直接检查硬件邮箱，避免 HAL 状态异常时 IsTxMessagePending 返回 0 被误认为发送结束。
 static uint8_t replay_poll_tx(uint8_t cancelling)

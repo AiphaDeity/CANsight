@@ -3,8 +3,8 @@
 
 #include "fatfs.h"
 #include "main.h"
-#include "stdio.h"
-#include "string.h"
+#include <stdio.h>
+#include <string.h>
 #include <ctype.h>
 
 // 一次攒一批文本再写卡，减少小块 SD 写入次数。

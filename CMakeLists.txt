@@ -98,12 +98,13 @@ if(CANSIGHT_LCD_FILL_DEBUG_O2)
 endif()
 message(STATUS "LCD fill Debug -O2: ${CANSIGHT_LCD_FILL_DEBUG_O2}")
 
-# 仅优化日志与统计源文件，分别测量应用处理开销，不传播到 HAL 或 SD 适配层。
+# 仅优化日志、统计与时间格式化源文件，不传播到 HAL 或 SD 适配层。
 option(CANSIGHT_RX_LOG_DEBUG_O2 "Use -O2 for CAN logging and statistics in firmware Debug builds" ON)
 if(CANSIGHT_RX_LOG_DEBUG_O2)
     set_property(SOURCE
         "${CMAKE_CURRENT_SOURCE_DIR}/Core/Src/can_logger.c"
         "${CMAKE_CURRENT_SOURCE_DIR}/Core/Src/can_stats.c"
+        "${CMAKE_CURRENT_SOURCE_DIR}/Core/Src/can_time.c"
         APPEND PROPERTY COMPILE_OPTIONS
         "$<$<AND:$<CONFIG:Debug>,$<COMPILE_LANG_AND_ID:C,GNU>>:-O2>"
     )
@@ -122,6 +123,7 @@ target_sources(${CMAKE_PROJECT_NAME} PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/Core/Src/sd_diskio_dma.c
     ${CMAKE_CURRENT_SOURCE_DIR}/Core/Src/can_stats.c
     ${CMAKE_CURRENT_SOURCE_DIR}/Core/Src/can_timestamp.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/Core/Src/can_time.c
     ${CMAKE_CURRENT_SOURCE_DIR}/Core/Src/log_player.c
     ${CMAKE_CURRENT_SOURCE_DIR}/GUI/Port/lv_port_disp.c
     ${CMAKE_CURRENT_SOURCE_DIR}/GUI/Port/lv_port_indev.c
