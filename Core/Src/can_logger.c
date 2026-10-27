@@ -1,3 +1,5 @@
+// SD 日志业务模块：主循环把接收帧追加为 CSV，再按缓冲容量、同步间隔和归档条件写卡。
+// 所有文件操作和本模块状态都由主循环上下文使用；printf 只输出诊断，不在中断调用。
 #include "can_logger.h"
 #include "can_time.h"
 
@@ -8,18 +10,19 @@
 #include <ctype.h>
 
 // 一次攒一批文本再写卡，减少小块 SD 写入次数。
-#define CAN_LOG_BUFFER_SIZE       4096U  //批量缓冲区大小
-#define CAN_LOG_SYNC_INTERVAL_MS  1000U  //每秒同步一次文件，降低突然断电时的丢失量
-#define CAN_LOG_FILE_NAME         "CANLOG.CSV"  //日志文件名
-#define CAN_LOG_ARCHIVE_MAX       999999999U
+#define CAN_LOG_BUFFER_SIZE       4096U  // CSV 文本缓冲容量，单位字节，不是帧数。
+#define CAN_LOG_SYNC_INTERVAL_MS  1000U  // 周期写出并同步的最小间隔，单位 ms。
+#define CAN_LOG_FILE_NAME         "CANLOG.CSV"  // 当前活动日志名，成功归档后继续创建同名新文件。
+#define CAN_LOG_ARCHIVE_MAX       999999999U  // 历史名称最多支持九位十进制编号。
 
+// 新格式时间是 64 位微秒；旧表头只用于识别启动时留下的历史格式。
 static const char csvHeader[] = "timestamp_us64,format,type,id,dlc,data_hex\r\n";
 static const char legacyHeader[] = "timestamp_us,format,type,id,dlc,data_hex\r\n";
-static CanArchiveState archiveState = CAN_ARCHIVE_IDLE;
+static CanArchiveState archiveState = CAN_ARCHIVE_IDLE;  // 请求待执行、完成、空文件或失败。
 static char lastArchiveName[CAN_LOG_ARCHIVE_NAME_SIZE];
-static uint32_t nextArchiveNumber = 1U;
-static uint32_t archiveRequestTick;
-static uint32_t archiveRevision;
+static uint32_t nextArchiveNumber = 1U;  // 下一个待尝试的归档编号，遇到同名对象继续递增。
+static uint32_t archiveRequestTick;  // 手动归档受理时的毫秒时刻，用于稍后执行文件操作。
+static uint32_t archiveRevision;  // 成功生成归档后的变化标记，通知浏览模块刷新目录。
 
 static FIL logFile;  //当前打开的日志文件对象
 static uint8_t logReady = 0U;  // 1 表示 SD 卡已挂载并打开日志文件，0 表示不可写
@@ -34,7 +37,8 @@ static CanLoggerDiagnostics diagnostics;  // 跨归档保留本次初始化以�
 static uint8_t logHasFrames;  // 独立记录非空状态，避免累计计数回绕后误判为空。
 static uint8_t firstWriteSyncReported = 0U;  // 首批报文完成写入并同步后提示一次，便于不拔卡确认日志工作
 
-// 发生 SD/FatFs 错误后停止继续写入，并只报告一次，SD卡故障时持续性错误。
+// 内部调用：禁止继续接纳日志，保存本次错误并将待归档请求置为失败。
+// 首次错误时输出底层首故障现场；不自动重挂载、重试写入或修复文件。
 static void CanLogger_StopWithError(const char *stage, FRESULT result)
 {
   logReady = 0U;  //关闭写入
@@ -81,7 +85,8 @@ static void CanLogger_StopWithError(const char *stage, FRESULT result)
 }
 
 
-// 同步成功仅表示 FatFs 及底层驱动已完成同步，不保证故障卡的物理持久性。
+// 内部调用：同步当前文件，返回原始 FatFs 结果；FR_OK 时更新 synced_frames。
+// 同步计数对应最近一次成功同步的累计写入数，不是本次新增帧数。
 static FRESULT CanLogger_SyncFile(void)
 {
   FRESULT result = f_sync(&logFile);
@@ -89,7 +94,8 @@ static FRESULT CanLogger_SyncFile(void)
   return result;
 }
 
-// 把 RAM 中积累的 CSV 内容写入当前文件。
+// 内部调用：将当前 CSV 缓冲完整写入文件，成功或缓冲为空返回 1，失败返回 0。
+// 同时检查 FatFs 状态与实际字节数；失败不清空缓冲，也不自动重复写入可能已部分写出的内容。
 static uint8_t CanLogger_FlushBuffer(void)
 {
   FRESULT result;  //FatFs 函数返回值
@@ -107,13 +113,15 @@ static uint8_t CanLogger_FlushBuffer(void)
     return 0U;
   }
 
+  // 仅整块写入成功才把缓冲帧计入 written；文件写入和后续 f_sync 是两个阶段。
   diagnostics.written_frames += diagnostics.buffered_frames;
   diagnostics.buffered_frames = 0U;
   logBufferLength = 0U;  // 完整缓冲写入成功后才释放，部分写入不计入完成帧数。
   return 1U;
 }
 
-// 从历史文件名提取编号，支持三位及以上编号，忽略大小写。
+// 启动扫描内部调用：从 CANLOG_ 加三至九位编号及 .CSV 的名称提取编号，忽略大小写。
+// 不匹配或编号为零返回 0；这里只识别编号，浏览模块另有更严格的规范名称检查。
 static uint32_t CanLogger_ParseArchiveNumber(const char *name)
 {
   const char *prefix = "CANLOG_";
@@ -134,7 +142,8 @@ static uint32_t CanLogger_ParseArchiveNumber(const char *name)
   return number;
 }
 
-// 启动时扫描根目录，在现有最大编号之后分配历史文件名。
+// 启动内部调用：同步遍历根目录，在已有最大归档编号后分配下一个编号。
+// 返回 FR_OK 或文件系统错误；实际重命名前还会检查目标是否已存在，避免覆盖。
 static FRESULT CanLogger_FindNextNumber(void)
 {
   DIR directory;
@@ -153,7 +162,8 @@ static FRESULT CanLogger_FindNextNumber(void)
   return FR_OK;
 }
 
-// 活动文件必须已关闭；目标已存在时跳过该编号，禁止覆盖文件或目录。
+// 内部调用，前提是活动文件已关闭：将 CANLOG.CSV 重命名为下一个可用归档名。
+// 成功更新最近归档名和版本号，返回 FR_OK；同名文件或目录占用时跳号，编号耗尽或出错则返回错误。
 static FRESULT CanLogger_RenameActive(void)
 {
   char source[32];
@@ -178,7 +188,8 @@ static FRESULT CanLogger_RenameActive(void)
   return FR_DENIED;
 }
 
-// 仅将零字节文件或内容完全等于表头的文件判定为空，其他旧内容均保留。
+// 启动内部调用：检查上次留下的活动文件，只把零长度或内容完全匹配表头的文件视为空。
+// 已有其他内容时先归档保存；旧格式空表头删后重建，返回 FatFs 结果。
 static FRESULT CanLogger_ArchivePrevious(void)
 {
   char path[32];
@@ -210,7 +221,8 @@ static FRESULT CanLogger_ArchivePrevious(void)
   return result;
 }
 
-// 打开新活动文件，或复用已确认的空日志，不截断已有数据。
+// 内部调用：打开活动日志，写入新表头或复用此前已确认的空日志，不截断已有数据。
+// 成功清空本文件计数并进入 RECORDING，返回 1；失败停止日志并返回 0。
 static uint8_t CanLogger_OpenActive(void)
 {
   char path[32];
@@ -248,7 +260,8 @@ static uint8_t CanLogger_OpenActive(void)
   return 1U;
 }
 
-// 归档上次采集的非空活动日志，成功后建立本次采集的活动文件。
+// main 启动时调用一次：重置诊断、挂载卷、查找编号、归档旧文件并准备新活动日志。
+// 返回 1 表示可记录，0 表示失败；不在运行中用此函数强行重置仍打开的文件对象。
 uint8_t CanLogger_Init(void)
 {
   memset(&diagnostics, 0, sizeof(diagnostics));
@@ -288,7 +301,8 @@ uint8_t CanLogger_Init(void)
   return 1U;
 }
 
-// 先持久化并关闭当前文件，再归档和建立新文件；失败时停止日志并保留原数据。
+// 主循环内部调用：刷出缓冲、同步并关闭当前文件，再重命名并创建新日志。
+// 没有帧则发布 EMPTY；任何阶段失败会停止日志，通过状态发布结果而非自动重试。
 static void CanLogger_ArchiveCurrent(void)
 {
   if(logHasFrames == 0U) {
@@ -318,6 +332,8 @@ static void CanLogger_ArchiveCurrent(void)
   archiveState = CanLogger_OpenActive() ? CAN_ARCHIVE_DONE : CAN_ARCHIVE_FAILED;
 }
 
+// 界面归档回调在主循环上下文调用：只提交请求，返回 1 表示受理，0 表示拒绝。
+// 暂停、日志不可用或已有请求时不受理；真正归档由主循环 Process 处理。
 uint8_t CanLogger_RequestArchive(void)
 {
   if(logState == CAN_LOG_PAUSED) return 0U;
@@ -331,7 +347,9 @@ uint8_t CanLogger_RequestArchive(void)
   return 1U;
 }
 
-// 把一帧格式化成CSV行并放入RAM缓冲区。
+// 主循环每取出一帧后调用：格式化一整行 CSV，追加到 RAM 缓冲并累计接纳数。
+// 容量不足或跨文件上限时可能同步写卡、归档；返回不等于该帧已经同步到 SD。
+// 回放暂停记录期间直接跳过，不累计 rejected；其他不可写或追加失败的有效帧累计拒收。
 void CanLogger_AddFrame(const CanFrame *frame)
 {
   if(logState == CAN_LOG_PAUSED) return;
@@ -345,6 +363,7 @@ void CanLogger_AddFrame(const CanFrame *frame)
     return;
   }
 
+  // 64 位微秒值最多 20 位十进制数字，另留 1 字节字符串结束符。
   char timestamp[21];
   CanTime_FormatUnsigned(timestamp, frame->timestamp_us);
   rowLength = snprintf(row, sizeof(row), "%s,%s,%s,0x%lX,%u,",
@@ -400,7 +419,7 @@ void CanLogger_AddFrame(const CanFrame *frame)
     }
   }
 
-  // 若当前行长度超过缓冲区大小，先写完已有内容，再放入新行。
+  // 若剩余空间容纳不下这一整行，先写出已有内容，再将新行放入清空后的缓冲。
   if ((UINT)used > (CAN_LOG_BUFFER_SIZE - logBufferLength)) 
   {
     if (CanLogger_FlushBuffer() == 0U)  //缓冲区写满时立即写卡
@@ -413,12 +432,14 @@ void CanLogger_AddFrame(const CanFrame *frame)
   memcpy(&logBuffer[logBufferLength], row, (size_t)used);  //将行放入缓冲区
   logBufferLength += (UINT)used;  //记录已使用的缓冲区字节数
   loggedFrameCount++;  // 当前活动文件接纳数，不表示已经完成同步。
+  // accepted 仅说明已复制到 RAM，written 和 synced 在实际写入、同步后分别更新。
   diagnostics.accepted_frames++;
   diagnostics.buffered_frames++;
   logHasFrames = 1U;
 }
 
-// 在主循环调用；SD 文件操作不在 CAN 中断中执行。
+// 主循环调用：推进自动/手动归档，按间隔写出缓冲并同步；暂停或不可写时不继续正常记录。
+// 此处使用同步 FatFs 接口，单次调用仍可能阻塞，不能保证每次严格在固定时间内完成。
 void CanLogger_Process(void)
 {
   if(logState == CAN_LOG_PAUSED) return;
@@ -429,7 +450,7 @@ void CanLogger_Process(void)
   }
 
   // 请求由界面提交，实际文件操作仅在主循环执行。
-  // 预留一个界面绘制周期，使请求提示先于同步文件操作显示；期间仍正常记录。
+  // 至少延后 50 ms，给请求提示留出绘制机会；不保证界面一定完成刷新，期间仍正常记录。
   if(archiveState == CAN_ARCHIVE_PENDING && HAL_GetTick() - archiveRequestTick >= 50U) {
     CanLogger_ArchiveCurrent();
   }
@@ -475,8 +496,12 @@ void CanLogger_Process(void)
   }
 }
 
+// 回放流程在主循环调用：paused 非零时先刷出并同步已有记录，成功后进入 PAUSED。
+// paused 为零时尝试恢复 RECORDING；返回 1 表示日志可用，0 表示不可用或暂停失败。
+// 暂停不会缓存期间的新接收数据，恢复也不会修复已经发生的日志错误。
 uint8_t CanLogger_SetPaused(uint8_t paused)
 {
+  // 只有原状态确为 PAUSED 才恢复；ERROR 等状态不会在这里被清除。
   if(!paused) {
     if(logState == CAN_LOG_PAUSED) {
       logState = CAN_LOG_RECORDING;
@@ -496,13 +521,19 @@ uint8_t CanLogger_SetPaused(uint8_t paused)
   return 1U;
 }
 
+// 主循环或界面查询：返回日志业务状态，不是物理插卡检测结果。
 CanLoggerState CanLogger_GetState(void) { return logState; }
+// 返回最近保存的 FatFs 日志错误码；不是 SDIO 寄存器位，也不是错误次数。
 uint32_t CanLogger_GetLastError(void) { return (uint32_t)lastError; }
+// 返回当前归档请求或最近归档的结果，不直接执行文件操作。
 CanArchiveState CanLogger_GetArchiveState(void) { return archiveState; }
+// 返回最近成功归档名的内部只读地址，没有成功归档时为空字符串；不能修改或释放。
 const char *CanLogger_GetLastArchiveName(void) { return lastArchiveName; }
+// 返回成功生成归档文件后递增的版本号，供历史列表发现变化，不等于归档总文件数。
 uint32_t CanLogger_GetArchiveRevision(void) { return archiveRevision; }
 
-// 返回按值复制的记录计数；归档不清零本次运行的累计值。
+// 主循环或界面查询：将累计计数复制到 snapshot，NULL 时不写入。
+// 计数跨文件归档保留，按 uint32_t 自然回绕；不能将 accepted、written、synced 相加。
 void CanLogger_GetDiagnostics(CanLoggerDiagnostics *snapshot)
 {
   if(snapshot != NULL) *snapshot = diagnostics;

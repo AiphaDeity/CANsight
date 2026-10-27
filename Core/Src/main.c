@@ -151,6 +151,7 @@ static uint32_t CAN_RxQueue_Depth(void)
 // 返回 1 表示成功；返回 0 表示队列已满，本帧被丢弃并计入软件丢帧数。
 static uint8_t CAN_RxQueue_PushFromISR(const CanFrame *frame)
 {
+  // 取得当前写入位置 head
   uint32_t head = canRxQueueHead;
 
   // 先计算写完本槽位后的位置；到达数组末尾时通过掩码绕回 0。
@@ -169,6 +170,7 @@ static uint8_t CAN_RxQueue_PushFromISR(const CanFrame *frame)
   // 数据内存屏障：保证帧内容先写完，再更新 head，防止主循环读取到半帧数据。
   __DMB();
 
+  // 完成入队后更新写入位置，并记录队列占用峰值
   canRxQueueHead = (uint16_t)nextHead;
   uint32_t depth = (nextHead - canRxQueueTail) & CAN_RX_QUEUE_MASK;
   if(depth > canRxQueuePeak) canRxQueuePeak = depth;
@@ -205,12 +207,15 @@ static uint8_t CAN_RxQueue_Pop(CanFrame *frame)
 // 主循环调用：串口可写时发送一个诊断字符，没有待发字符或硬件未就绪时立即返回。
 static void CAN_ServiceSerial(void)
 {
+  // 判断有没有待发字符
   if(canSerialHead == canSerialTail) return;
-  // TXE 表示发送数据寄存器可写；同时确认串口和发送功能已启用，不等待整字节发送完成。
+  // 判断串口现在能不能接收一个待发字符，并检查控制寄存器 CR1 中的两个开关是否都已打开
   if((READ_REG(USART6->SR) & USART_SR_TXE) != 0U &&
      (READ_REG(USART6->CR1) & (USART_CR1_UE | USART_CR1_TE)) == (USART_CR1_UE | USART_CR1_TE))
   {
+    // 取一个字符，写入串口数据寄存器
     WRITE_REG(USART6->DR, canSerialBuffer[canSerialTail]);
+    // 移动读取位置，释放这个软件槽位
     canSerialTail = (uint16_t)((canSerialTail + 1U) & (CAN_SERIAL_BUFFER_SIZE - 1U));
   }
 }
@@ -372,7 +377,8 @@ int main(void)
       CAN_IT_ERROR_WARNING | CAN_IT_ERROR_PASSIVE | CAN_IT_BUSOFF |
       CAN_IT_LAST_ERROR_CODE | CAN_IT_ERROR;
 
-  // 依次检查 CAN 状态、配置过滤器、启动和开启通知；这里失败后仍进入主循环。
+  // 依次检查 CAN 状态、配置过滤器、启动和开启通知；
+  // 任一步失败后记录错误，必要时停止 CAN；CPU 仍进入主循环，继续处理界面和诊断。
   if (HAL_CAN_GetState(&hcan1) != HAL_CAN_STATE_READY ||
       HAL_CAN_ConfigFilter(&hcan1, &canFilter) != HAL_OK ||
       HAL_CAN_Start(&hcan1) != HAL_OK ||
@@ -395,6 +401,7 @@ int main(void)
     printf("CAN1 Sight Start\r\n");
   }
 
+  // 更新启动结果，让界面能够显示运行中或错误
   CAN_PublishRuntime();
 
   // 保存各项调度的毫秒时间；减去间隔，让界面和历史服务在首轮即可满足时间条件。
@@ -443,20 +450,27 @@ int main(void)
 
     // 4. 队列积压高时暂缓 LVGL，降到恢复阈值后再处理触摸、定时器和绘制。
     uint32_t uiQueueDepth = CAN_RxQueue_Depth();
+    // 队列积压高时暂停 LVGL 绘制，避免卡顿
     if(uiQueueDepth >= CAN_UI_PAUSE_DEPTH) canUiDeferred = 1U;
     else if(uiQueueDepth <= CAN_UI_RESUME_DEPTH) canUiDeferred = 0U;
+    // 判断是否允许处理文件：积压 ≤ 128 帧且间隔 ≥ 5 ms
     if(!canUiDeferred && HAL_GetTick() - lastUiTick >= CAN_UI_INTERVAL_MS)
     {
+      // 持续更新队列积压、丢帧、SD 记录状态和错误等信息
       CAN_PublishRuntime();
+      // LCD 显示：绘制界面
       lv_timer_handler();
+      // 更新界面
       lastUiTick = HAL_GetTick();
     }
 
     // 5. 接收积压较少且达到调度间隔时，推进历史目录、索引、预览或删除请求。
     uint32_t queued = ((uint32_t)canRxQueueHead - canRxQueueTail) & CAN_RX_QUEUE_MASK;
+    // 接收积压过低且达到调度间隔时，处理历史目录、索引、预览或删除请求。
     if(queued <= CAN_HISTORY_QUEUE_LIMIT &&
        HAL_GetTick() - lastHistoryTick >= CAN_HISTORY_INTERVAL_MS)
     {
+      // 处理历史目录、索引、预览或删除请求
       LogPlayer_Process();
       lastHistoryTick = HAL_GetTick();
     }
@@ -473,9 +487,9 @@ int main(void)
             canSerialHead == canSerialTail &&
             HAL_GetTick() - lastReceiveTick >= CAN_SUMMARY_IDLE_MS)
     {
+      // 打印摘要
       summaryPending = 0U;
       CAN_PrintSummary();
-      // 摘要文字先入串口缓冲，后续每轮继续发送，同时照常处理新收到的 CAN 帧。
     }
 
     // 7. 再尝试发送一个诊断字符；接收队列为空、无回放且无待发文字时才延时 1 ms。

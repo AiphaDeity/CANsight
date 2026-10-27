@@ -1,30 +1,40 @@
+// LCD 板级驱动：保留屏幕原有初始化序列，提供 LVGL 刷新所需的窗口和像素写入。
+// LCD_REG / LCD_RAM 是 FSMC 映射的外设地址，赋值会产生总线访问，不是向普通 RAM 数组写数据。
 #include "lcd.h"
 #include <stddef.h>
 
 // 当前 OTM8009A 屏幕参数，供窗口设置及初始化使用。
 _lcd_dev lcddev;
 
+// 主循环或初始化调用：通过 FSMC 命令地址写入寄存器/命令编号，后续数据写入该命令。
 void LCD_WR_REG(uint16_t regval)
 {
 	LCD->LCD_REG = regval; // 写入要写的寄存器序号
 }
 
+// 通过 FSMC 数据地址写入一个 16 位值，含义由之前选择的命令决定。
+// 像素写入状态下它是 RGB565 像素；初始化时也用于寄存器参数，不进行 DMA。
 void LCD_WR_DATA(uint16_t data)
 {
 	LCD->LCD_RAM = data;
 }
 
+// 先写命令编号再写参数，封装一次寄存器设置；两个访问仍由 CPU 顺序执行。
 void LCD_WriteReg(uint16_t LCD_Reg, uint16_t LCD_RegValue)
 {
 	LCD->LCD_REG = LCD_Reg;			 // 写入要写的寄存器序号
 	LCD->LCD_RAM = LCD_RegValue; // 写入数据
 }
 
+// 选择 lcddev.wramcmd，令后续数据地址写入成为窗口内的像素数据。
+// 调用方应先设置窗口；本函数不提供或生成像素内容。
 void LCD_WriteRAM_Prepare(void)
 {
 	LCD->LCD_REG = lcddev.wramcmd;
 }
 
+// 当前 0x8009 屏幕的矩形窗口设置：起止 x/y 均包含在区域内，不是单个光标坐标。
+// 将坐标高低字节写入 X/Y 地址寄存器；调用方保证范围与后续像素数量相符。
 void LCD_SetCursor(uint16_t Xspos, uint16_t Yspos,uint16_t Xepos, uint16_t Yepos)
 {
 	if (lcddev.id == 0x8009)
@@ -64,6 +74,8 @@ void LCD_SetCursor(uint16_t Xspos, uint16_t Yspos,uint16_t Xepos, uint16_t Yepos
 	}
 }
 
+// 初始化内部调用：把扫描方向映射到控制寄存器，并按方向交换宽高、重设全屏窗口。
+// dir 使用头文件的方向枚举宏；保留原驱动分支，不代表所有控制器都经过本项目验证。
 void LCD_Scan_Dir(uint8_t dir)
 {
 	uint16_t regval = 0;
@@ -160,6 +172,8 @@ void LCD_Scan_Dir(uint8_t dir)
 	}
 }
 
+// 初始化内部调用：dir 为 0 设竖屏，否则设横屏，同时准备尺寸与命令编号。
+// 再应用默认扫描方向；LVGL 当前固定 800×480，不能只改此参数就认为上层显示也已适配。
 void LCD_Display_Dir(uint8_t dir)
 {
 	if (dir == 0) // 竖屏
@@ -183,21 +197,25 @@ void LCD_Display_Dir(uint8_t dir)
 	LCD_Scan_Dir(DFT_SCAN_DIR); // 默认扫描方向
 }
 
+// 启动时在 FSMC 配置和 GT911 复位后调用：等待屏幕稳定，设置写时序并发送原始初始化序列。
+// 最后设为横屏；寄存器表属于屏幕硬件配置，保留原说明，不在这里推测未核实的私有参数。
 void LCD_Init(void)
 {
 	HAL_Delay(50); // delay 50 ms
-	//LCD_WriteReg(0x0000, 0x0001);
-	HAL_Delay(100);																 // delay 50 ms
+	// LCD_WriteReg(0x0000, 0x0001);
+	HAL_Delay(100); // 继续等待屏幕稳定，单位 ms。
 
+	// 当前直接指定已知屏幕型号，不是从硬件读取后自动识别任意屏幕。
 	lcddev.id = 0x8009;
 
 	// 重新配置写时序控制寄存器的时序
 	FSMC_Bank1E->BWTR[6] &= ~(0XF << 0); // 地址建立时间(ADDSET)清零
 	FSMC_Bank1E->BWTR[6] &= ~(0XF << 8); // 数据保存时间清零
-	FSMC_Bank1E->BWTR[6] |= 3 << 0;			 // 地址建立时间(ADDSET)为3个HCLK =18ns
-	FSMC_Bank1E->BWTR[6] |= 2 << 8;			 // 数据保存时间(DATAST)为6ns*3个HCLK=18ns
+	FSMC_Bank1E->BWTR[6] |= 3 << 0;			 // ADDSET 字段编码写入 3，具体周期按 FSMC 时序定义换算。
+	FSMC_Bank1E->BWTR[6] |= 2 << 8;			 // DATAST 字段编码写入 2，保留当前屏幕的写时序配置。
 
 	/// HSD43+OTM8009A  20221116  ok
+	// 下面保留原屏幕的模式、供电、灰阶及面板驱动初始化序列，不能按普通业务参数随意调整。
 	LCD_WR_REG(0xff00); //
 	LCD_WR_DATA(0x80);
 	LCD_WR_REG(0xff01); // enable EXTC
@@ -287,9 +305,9 @@ void LCD_Init(void)
 	LCD_WR_REG(0xC5B1); // DC voltage setting ;[0]GVDD output, default: 0xa8
 	LCD_WR_DATA(0xA9);
 
-	//--------------------------------------------------------------------------------
-	//		initial setting 2 < tcon_goa_wave >
-	//--------------------------------------------------------------------------------
+	// --------------------------------------------------------------------------------
+	// 		initial setting 2 < tcon_goa_wave >
+	// --------------------------------------------------------------------------------
 	// CE8x : vst1, vst2, vst3, vst4
 	LCD_WR_REG(0xCE80); // ce81[7:0] : vst1_shift[7:0]
 	LCD_WR_DATA(0x85);
@@ -462,9 +480,9 @@ void LCD_Init(void)
 	LCD_WR_REG(0xCFd0); // cfd1[7:0] : 0000000, reg_goa_frame_odd_high
 	LCD_WR_DATA(0x00);	// Parameter 1
 
-	//--------------------------------------------------------------------------------
-	//		initial setting 3 < Panel setting >
-	//--------------------------------------------------------------------------------
+	// --------------------------------------------------------------------------------
+	// 		initial setting 3 < Panel setting >
+	// --------------------------------------------------------------------------------
 	// cbcx
 	LCD_WR_REG(0xCBc0); // cbc1[7:0] : enmode H-byte of sig1  (pwrof_0, pwrof_1, norm, pwron_4 )
 	LCD_WR_DATA(0x00);
@@ -723,6 +741,7 @@ void LCD_Init(void)
 	LCD_WR_REG(0xCCde); // ccdf[7:0] : reg setting for signal40 selection with d2u mode
 	LCD_WR_DATA(0x00);
 
+	// 初始化末段按原配置设置像素格式、退出休眠并打开显示，延时供屏幕内部稳定。
 	LCD_WR_REG(0x3A00);
 	LCD_WR_DATA(0x55);
 
@@ -741,6 +760,9 @@ void LCD_Init(void)
 #if defined(CANSIGHT_LCD_FILL_O2) && CANSIGHT_LCD_FILL_O2 && defined(__GNUC__)
 __attribute__((optimize("O2")))
 #endif
+// LVGL 刷新路径调用：将 color 指向的连续 RGB565 像素同步写入包含右下角的矩形区域。
+// 至少提供 (ex-sx+1)*(ey-sy+1) 个像素；仅检查 NULL 和坐标反序，不裁剪屏幕范围或检查源容量。
+// CPU 通过 volatile 外设地址逐像素写入，函数返回后缓冲才能复用，不是用同一颜色填满。
 void LCD_Color_Fill(uint16_t sx, uint16_t sy, uint16_t ex, uint16_t ey, uint16_t *color)
 {
 	if(color == NULL || ex < sx || ey < sy) return;
@@ -748,6 +770,7 @@ void LCD_Color_Fill(uint16_t sx, uint16_t sy, uint16_t ex, uint16_t ey, uint16_t
 	// 窗口内按现有扫描方向自动递增，一块像素数据仅设置一次窗口。
 	LCD_SetCursor(sx, sy, ex, ey);
 	LCD_WriteRAM_Prepare();
+	// 目标地址固定，屏幕控制器自动推进窗口位置；源指针每次前进到下一个像素。
 	volatile uint16_t *ram = &LCD->LCD_RAM;
 	while(count-- != 0U) {
 		*ram = *color++;

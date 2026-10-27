@@ -1,3 +1,7 @@
+// 触摸界面模块：启动时创建基本控件，随后由主循环中的 LVGL 事件和定时器更新。
+// 接收页读取 CanStats 最新汇总，SD 页读取 LogPlayer 浏览/回放状态，不在本文件直接调用 FatFs。
+// 按钮回调只修改显示或提交业务请求；真正的文件操作和 CAN 回放由主循环推进。
+// 阅读顺序：ui_init -> 页面创建与事件绑定 -> 输入/按钮回调 -> refresh_stats_widgets 更新显示。
 #include "ui.h"
 #include "can_stats.h"
 #include "log_player.h"
@@ -14,18 +18,21 @@ LV_FONT_DECLARE(lv_font_cansight_14);
 #define UI_COLOR_MUTED    0x9AA3AF
 #define UI_COLOR_BLUE     0x2878E3
 
+// 两个业务页按需创建、互相切换时释放；下面的指针只由主循环上下文使用。
 static lv_obj_t *receive_page;
 static lv_obj_t *playback_page;
 static lv_obj_t *receive_tab;
 static lv_obj_t *playback_tab;
 static lv_obj_t *total_label;       // 全局接收帧数标签。
 static lv_obj_t *capacity_label;    // 统计表容量不足提示。
-static lv_obj_t *can_status_label;
-static lv_obj_t *sd_status_label;
-static lv_obj_t *diagnostics_label;
-static ui_archive_callback_t archive_callback;
+static lv_obj_t *can_status_label;  // 当前 CAN 运行状态，与累计错误提示分开显示。
+static lv_obj_t *sd_status_label;   // 日志业务状态，不是物理插卡检测。
+static lv_obj_t *diagnostics_label; // 累计接收、CAN 和日志异常类别提示。
+static ui_archive_callback_t archive_callback;  // main 注册的请求桥接函数，不是文件写入实现。
+// 文件按钮及其稳定名称副本；回调绑定副本，避免刷新目录后使用错误的条目索引。
 static lv_obj_t *file_buttons[LOG_PLAYER_PAGE_SIZE];
 static char file_button_names[LOG_PLAYER_PAGE_SIZE][CAN_LOG_ARCHIVE_NAME_SIZE];
+// 以下为 SD 页面控件，只有 playback_page 有效时才参与显示刷新。
 static lv_obj_t *list_status_label;
 static lv_obj_t *list_page_label;
 static lv_obj_t *list_previous;
@@ -34,12 +41,12 @@ static lv_obj_t *preview_status_label;
 static lv_obj_t *preview_table;
 static lv_obj_t *preview_count_label;
 static lv_obj_t *storage_label;
-static char history_message[100];
-static uint32_t history_message_tick;
-static bool archive_notice_valid;
-static CanArchiveState archive_notice_state;
-static char archive_notice_name[CAN_LOG_ARCHIVE_NAME_SIZE];
-static LogDeleteState displayed_delete_state;
+static char history_message[100];  // 临时操作提示文本，错误/进度提示的优先级更高。
+static uint32_t history_message_tick;  // 临时提示设置时刻，单位 ms，显示窗口为 3000 ms。
+static bool archive_notice_valid;  // 是否已有归档状态基准，避免刚建页面就提示旧归档成功。
+static CanArchiveState archive_notice_state;  // 上次显示检查到的归档状态。
+static char archive_notice_name[CAN_LOG_ARCHIVE_NAME_SIZE];  // 上次归档名，识别连续成功归档的变化。
+static LogDeleteState displayed_delete_state;  // 识别删除状态变化，避免每次刷新都重新弹成功提示。
 static lv_obj_t *delete_button;
 static lv_obj_t *delete_dialog;
 static lv_obj_t *frame_previous;
@@ -48,33 +55,35 @@ static lv_obj_t *replay_start_button;
 static lv_obj_t *replay_pause_button;
 static lv_obj_t *replay_stop_button;
 static char delete_target[CAN_LOG_ARCHIVE_NAME_SIZE];  // 弹窗打开时固定目标，确认后不重新取当前选中项。
-static uint32_t displayed_player_revision;
-static bool player_display_valid;
-static CanStatsRuntime displayed_runtime;
-static bool runtime_display_valid;
+static uint32_t displayed_player_revision;  // 已显示的浏览版本，未变化则跳过列表与预览更新。
+static bool player_display_valid;  // 页面重建、编辑或回放结束后需强制重绘时清零。
+static CanStatsRuntime displayed_runtime;  // 上次状态栏快照，用于仅更新有变化的文字与颜色。
+static bool runtime_display_valid;  // 首次刷新前快照无效，确保初始状态能完整显示。
 static uint32_t displayed_total;    // 上次刷新时的累计帧数。
 static uint16_t receive_offset;     // 当前页在筛选结果中的起始偏移。
 #define RECEIVE_VISIBLE_ROWS 8U  // 单页最大条目数，用于限制控件内存占用。
 
 typedef struct {
-    lv_obj_t *input;
-    lv_obj_t *table;
-    lv_obj_t *matches;
+    lv_obj_t *input;    // 本页 ID 输入框，页面删除后不再使用其地址。
+    lv_obj_t *table;    // 接收表格或历史预览表格。
+    lv_obj_t *matches;  // 匹配范围或历史帧号提示。
     char text[11]; // 0x + 8 位十六进制数 + 字符串结束符
-    bool validity_known;
-    bool valid;
+    bool validity_known;  // 是否已设置过合法性样式，避免重复更新边框。
+    bool valid;           // 上一次应用样式时的输入合法性。
 } ui_filter_t;
 
+// 文本保存在静态结构中，页面切换可保留筛选；控件地址在页面重建时重新绑定。
 static ui_filter_t receive_filter;
 static ui_filter_t history_filter;
-static lv_obj_t *hex_keyboard;
-static ui_filter_t *keyboard_filter;
-static bool receive_filter_dirty;
+static lv_obj_t *hex_keyboard;  // 顶层键盘启动时创建，之后只显示/隐藏并复用。
+static ui_filter_t *keyboard_filter;  // 当前绑定的筛选框；NULL 表示没有正在编辑的筛选。
+static bool receive_filter_dirty;  // 编辑后尚未应用到接收表格，关闭键盘后由定时刷新处理。
 
 static void refresh_player(void);
 static bool parse_filter(const char *text, uint32_t *id, bool *all);
 
-// 历史筛选通过 Apply 或键盘确认提交，输入过程中不反复扫描文件。
+// 内部查询：输入框文本是否与 LogPlayer 当前实际筛选一致；一致返回 true。
+// 输入变化不代表业务筛选已更新，只有 Apply 或键盘确认后才提交。
 static bool history_filter_applied(void)
 {
     uint32_t id;
@@ -84,6 +93,8 @@ static bool history_filter_applied(void)
         view->filter_enabled == !all && (all || view->filter_id == id);
 }
 
+// 内部工具：解析空串或可选 0x 前缀的十六进制 ID；合法返回 true，否则 false。
+// 空串置 all=true；非空最多八位且不超过 29 位 ID，结果写入 id / all，不访问业务或硬件。
 static bool parse_filter(const char *text, uint32_t *id, bool *all)
 {
     *id = 0;
@@ -100,13 +111,15 @@ static bool parse_filter(const char *text, uint32_t *id, bool *all)
         else if(*text >= 'a' && *text <= 'f') digit = (uint32_t)(*text - 'a' + 10);
         else return false;
         if(++digits > 8) return false;
+        // 每个十六进制字符占四位，先将已有结果左移，再拼入当前数字。
         *id = (*id << 4) | digit;
         text++;
     }
     return *id <= 0x1FFFFFFFU;
 }
 
-// 内容变化时才更新单元格，避免周期刷新反复分配内存及重算相同文本。
+// 界面内部调用：比较单元格旧文本，只有变化时才调用 LVGL 更新，减少分配、布局和重绘。
+// row / column 使用已有表格结构；不修改接收统计或文件数据。
 static void set_table_cell_if_changed(lv_obj_t *table, uint32_t row,
                                       uint32_t column, const char *text)
 {
@@ -116,20 +129,21 @@ static void set_table_cell_if_changed(lv_obj_t *table, uint32_t row,
     }
 }
 
-// 相同文案不重新设置，避免匹配统计反复触发重绘。
+// 界面内部调用：只在标签文字不同时更新；label 必须是当前仍有效的标签对象。
 static void set_label_if_changed(lv_obj_t *label, const char *text)
 {
     if(strcmp(lv_label_get_text(label), text) != 0) lv_label_set_text(label, text);
 }
 
-// 操作结果仅短暂显示，历史加载和错误状态由统一刷新函数优先呈现。
+// 内部调用：复制一次临时操作提示并记录毫秒时刻，后续刷新决定是否和何时显示。
+// 不直接改变日志或浏览状态，错误与进度提示可以覆盖它。
 static void set_history_message(const char *text)
 {
     lv_snprintf(history_message, sizeof(history_message), "%s", text);
     history_message_tick = lv_tick_get();
 }
 
-// 输入框仅在有效性变化时更新边框，初始化时设置一次默认样式。
+// 内部调用：只在首次或合法性变化时更新筛选框边框，并保存已经显示的结果。
 static void set_filter_validity(ui_filter_t *filter, bool valid)
 {
     if(!filter->validity_known || filter->valid != valid) {
@@ -140,7 +154,8 @@ static void set_filter_validity(ui_filter_t *filter, bool valid)
     }
 }
 
-// 根据筛选条件和分页偏移刷新接收表格，不修改底层统计。
+// 主循环中的界面刷新或事件调用：按 ID 和分页读取统计表，只更新最多八行的最新数据。
+// 编辑该筛选框时暂停刷新表格；显示筛选不丢弃接收帧，也不改变 SD 记录。
 static void refresh_receive(ui_filter_t *filter)
 {
     // 编辑期间仅更新输入框，避免每次退格都重绘报文表格。
@@ -205,6 +220,8 @@ static void refresh_receive(ui_filter_t *filter)
     set_filter_validity(filter, valid);
 }
 
+// 内部调用：接收筛选直接刷新已有统计显示；历史筛选合法时向 LogPlayer 提交重建请求。
+// 这里只更新请求和控件，不在界面回调中执行文件扫描。
 static void refresh_filter(ui_filter_t *filter)
 {
     if(filter == &history_filter) {
@@ -219,6 +236,8 @@ static void refresh_filter(ui_filter_t *filter)
     else refresh_receive(filter);
 }
 
+// 内部调用：解除输入框绑定并隐藏复用键盘，不删除键盘，不自动恢复先前输入。
+// 页面删除前先解除绑定，避免键盘继续持有已经释放的输入框地址。
 static void close_hex_keyboard(void)
 {
     if(hex_keyboard == NULL) return;
@@ -228,6 +247,8 @@ static void close_hex_keyboard(void)
     keyboard_filter = NULL;
 }
 
+// LVGL 确认/取消事件回调，运行于主循环：历史筛选只在确认事件中提交。
+// 两种事件都会隐藏键盘；接收筛选已记为待刷新，之后由定时器应用，取消不回滚已输入文字。
 static void keyboard_done_cb(lv_event_t *event)
 {
     if(lv_event_get_code(event) == LV_EVENT_READY && keyboard_filter == &history_filter)
@@ -236,6 +257,8 @@ static void keyboard_done_cb(lv_event_t *event)
     keyboard_filter = NULL;
 }
 
+// 启动界面时创建一次顶层十六进制键盘，静态按键表和控制表在后续使用期间保持有效。
+// 退格禁止长按连发，关闭弹出提示与阴影，避免连续输入引发过多界面重绘。
 static void create_hex_keyboard(void)
 {
     static const char * const map[] = {
@@ -268,14 +291,19 @@ static void create_hex_keyboard(void)
     }
 }
 
+// LVGL 输入框点击回调：从事件用户数据取得所属筛选结构，绑定并显示已有键盘。
+// 回调运行于主循环，不是触摸硬件中断。
 static void filter_clicked_cb(lv_event_t *event)
 {
     ui_filter_t *filter = lv_event_get_user_data(event);
     keyboard_filter = filter;
+    // 键盘对象在启动阶段已建立；这里只绑定当前仍有效的输入框，不重复分配。
     lv_keyboard_set_textarea(hex_keyboard, filter->input);
     lv_obj_set_hidden(hex_keyboard, false);
 }
 
+// LVGL 输入值变化回调：复制文本，接收页标记待刷新；编辑期间主要更新合法性样式。
+// 历史页只提示文本尚未应用，不每输入一个字符就扫描文件。
 static void filter_changed_cb(lv_event_t *event)
 {
     ui_filter_t *filter = lv_event_get_user_data(event);
@@ -305,6 +333,8 @@ static void filter_changed_cb(lv_event_t *event)
     refresh_filter(filter);
 }
 
+// LVGL 清除按钮回调：关闭键盘并清空控件与文本副本，再应用空筛选。
+// 空筛选表示全部 ID；显式清副本以兼容设置空串不触发值变化事件的情况。
 static void filter_clear_cb(lv_event_t *event)
 {
     ui_filter_t *filter = lv_event_get_user_data(event);
@@ -316,10 +346,12 @@ static void filter_clear_cb(lv_event_t *event)
     refresh_filter(filter);
 }
 
-// 禁用时仅改变文字和边框，覆盖主题的浅色重着色，不创建半透明图层。
+// 创建控件时调用：设置禁用文字和边框颜色，覆盖主题的重着色与过渡效果。
+// 空过渡属性表必须有有效地址且长期存在，不能用空指针代替。
 static void style_disabled_control(lv_obj_t *obj)
 {
     // 当前 LVGL 直接遍历 transition->props，禁用过渡须提供有效的空列表。
+    // 样式保存描述符地址，故使用 static 保证生命周期覆盖后续绘制。
     static const lv_style_prop_t no_transition_props[] = {0};
     static const lv_style_transition_dsc_t no_transition = {.props = no_transition_props};
     lv_obj_set_style_recolor_opa(obj, LV_OPA_TRANSP, LV_PART_MAIN | LV_STATE_DISABLED);
@@ -329,6 +361,8 @@ static void style_disabled_control(lv_obj_t *obj)
     lv_obj_set_style_transition(obj, &no_transition, LV_PART_MAIN | LV_STATE_DISABLED);
 }
 
+// 页面创建内部调用：将静态筛选状态绑定到本次新建的控件，配置输入约束和事件回调。
+// 最后执行首次刷新；历史页须先创建刷新会用到的所有按钮、标签和表格。
 static void bind_filter(ui_filter_t *filter, lv_obj_t *input, lv_obj_t *clear,
                         lv_obj_t *table, lv_obj_t *matches)
 {
@@ -352,7 +386,8 @@ static void bind_filter(ui_filter_t *filter, lv_obj_t *input, lv_obj_t *clear,
     refresh_filter(filter);
 }
 
-// 接收和回放表格共用外观，避免只修好其中一页。
+// 表格创建时调用：统一接收/预览外观，禁用点击、滚动和选择交互。
+// 表格只展示数据，避免按下和松开导致不必要的整表重绘。
 static void style_data_table(lv_obj_t *table)
 {
     // 表格仅显示数据，不使用单元格选择；默认按下和松开事件会使整表失效。
@@ -372,7 +407,8 @@ static void style_data_table(lv_obj_t *table)
     lv_obj_set_style_border_width(table, 1, LV_PART_ITEMS);
 }
 
-// 创建了标签控件并设置属性
+// 内部创建工具：在 parent 下建立固定中文字体标签，设置文字、位置、宽度和颜色并返回对象。
+// 字体只包含项目需要的字符，不支持任意新增中文字；返回对象由所属页面管理生命周期。
 static lv_obj_t *create_label(lv_obj_t *parent, const char *text,
                               lv_coord_t x, lv_coord_t y, lv_coord_t width,
                               lv_color_t color)
@@ -390,18 +426,19 @@ static lv_obj_t *create_label(lv_obj_t *parent, const char *text,
     return label;
 }
 
-//创建按钮控件
+// 内部创建工具：建立按钮及居中标签，设置统一样式并返回按钮对象。
+// selected 只决定初始选中背景，不代表自动绑定业务选择状态；调用方另行注册事件。
 static lv_obj_t *create_button(lv_obj_t *parent, const char *text,
                                lv_coord_t x, lv_coord_t y, lv_coord_t width,
                                lv_coord_t height, bool selected)
 {
-    //创建按钮并设置位置和尺寸
+    // 创建按钮并设置位置和尺寸
     lv_obj_t *button = lv_button_create(parent);
     lv_obj_set_scrollable(button, false);
     lv_obj_set_pos(button, x, y);
     lv_obj_set_size(button, width, height);
 
-    //设置按钮样式：背景色根据选中状态决定，添加边框和圆角 
+    // 设置按钮样式：背景色根据选中状态决定，添加边框和圆角
     lv_obj_set_style_bg_color(button,
                               lv_color_hex(selected ? UI_COLOR_BLUE : UI_COLOR_PANEL),
                               LV_PART_MAIN);
@@ -411,7 +448,7 @@ static lv_obj_t *create_button(lv_obj_t *parent, const char *text,
     lv_obj_set_style_text_color(button, lv_color_hex(UI_COLOR_TEXT), LV_PART_MAIN);
     style_disabled_control(button);
 
-    //创建按钮文本标签并居中显示
+    // 创建按钮文本标签并居中显示
     lv_obj_t *label = lv_label_create(button);
     lv_obj_set_style_text_font(label, &lv_font_cansight_14, LV_PART_MAIN);
     lv_label_set_text(label, text);
@@ -420,16 +457,18 @@ static lv_obj_t *create_button(lv_obj_t *parent, const char *text,
     return button;
 }
 
-//显示指定的页面（接收页面或回放页面）
+// 显示指定的页面（接收页面或回放页面）
 static void create_receive_page(lv_obj_t *screen);
 static void create_playback_page(lv_obj_t *screen);
 
+// main 在界面初始化前调用：保存归档请求桥接函数，按钮点击时才调用，不立即归档。
 void ui_set_archive_callback(ui_archive_callback_t callback)
 {
     archive_callback = callback;
 }
 
-// 仅由手动归档按钮提交请求，页面切换不改变活动文件。
+// 主循环界面内部调用：有桥接函数时设置临时提示并提交归档请求，不直接操作文件。
+// 提示只表示用户操作已发出，最终成功或失败仍由日志状态确认。
 static void request_archive(void)
 {
     if(archive_callback != NULL) {
@@ -441,13 +480,15 @@ static void request_archive(void)
     }
 }
 
+// LVGL 归档按钮点击回调：转交 request_archive；实际文件操作由主循环日志流程推进。
 static void archive_event_cb(lv_event_t *event)
 {
     (void)event;
     request_archive();
 }
 
-// 弹窗可能从自身事件关闭，先隐藏并延后释放，避免事件处理期间访问已释放对象。
+// 内部调用：先隐藏删除确认遮罩，再请求 LVGL 异步删除并撤销本模块指针。
+// 避免在弹窗自身事件执行中立即释放仍可能被事件处理使用的对象。
 static void close_delete_dialog(void)
 {
     if(delete_dialog == NULL) return;
@@ -456,6 +497,8 @@ static void close_delete_dialog(void)
     delete_dialog = NULL;
 }
 
+// 标签切换内部调用：关闭键盘和弹窗，释放另一页并按需创建当前页，更新标签背景。
+// 两张业务表格不同时常驻；离开 SD 页会请求停止回放，但实际停止仍由主循环确认。
 static void show_page(bool show_playback)
 {
     close_hex_keyboard();
@@ -466,6 +509,7 @@ static void show_page(bool show_playback)
         if(receive_page != NULL) {
             lv_obj_delete(receive_page);
             receive_page = NULL;
+            // 删除父页面会连带释放子控件，清空保存的地址，防止定时刷新再次访问。
             receive_filter.input = receive_filter.table = receive_filter.matches = NULL;
         }
         if(playback_page == NULL) {
@@ -486,7 +530,7 @@ static void show_page(bool show_playback)
         }
     }
 
-    //更新标签页背景颜色，选中的标签页显示蓝色高亮
+    // 更新标签页背景颜色，选中的标签页显示蓝色高亮
     lv_obj_set_style_bg_color(receive_tab,
                               lv_color_hex(show_playback ? UI_COLOR_PANEL : UI_COLOR_BLUE),
                               LV_PART_MAIN);
@@ -495,18 +539,16 @@ static void show_page(bool show_playback)
                               LV_PART_MAIN);
 }
 
-//标签页切换事件回调函数
+// LVGL 标签点击回调：按触发事件的标签选择接收页或 SD 页，不直接处理文件或 CAN 帧。
 static void tab_event_cb(lv_event_t *event)
 {
-    //判断当前触发事件的标签是否为回放标签页
+    // 判断当前触发事件的标签是否为回放标签页
     bool show_playback = lv_event_get_current_target(event) == playback_tab;
-    //根据判断结果切换显示对应的页面和标签样式
+    // 根据判断结果切换显示对应的页面和标签样式
     show_page(show_playback);
 }
 
-/**
- * @brief 将 FatFs 错误码映射为名称，供历史操作错误提示使用。
- */
+// 内部工具：按当前 FatFs FRESULT 编号返回只读错误名称，超出表范围返回 FR_UNKNOWN。
 static const char *fatfs_error_name(uint32_t error)
 {
     // 错误值对应当前 FatFs ff.h 的 FRESULT 定义。
@@ -520,7 +562,8 @@ static const char *fatfs_error_name(uint32_t error)
     return error < sizeof(names) / sizeof(names[0]) ? names[error] : "FR_UNKNOWN";
 }
 
-// 归档仅在状态或文件名变化时生成临时提示，不常驻展示最近归档文件。
+// 状态刷新内部调用：识别归档状态或文件名变化，生成完成或空文件的临时提示。
+// 新建页面先建立比较基准，不把进入页面时已有的旧结果反复提示为新操作。
 static void refresh_archive(const CanStatsRuntime *runtime)
 {
     if(playback_page == NULL) return;
@@ -538,7 +581,8 @@ static void refresh_archive(const CanStatsRuntime *runtime)
     }
 }
 
-// 进度和错误共用一行；正常就绪时不重复解释记录状态或时间戳格式。
+// SD 页面刷新内部调用：按优先级选择一条错误、操作进度、临时结果或回放状态文字。
+// 停止未确认和文件错误优先于普通提示，避免被短暂成功消息掩盖。
 static void refresh_history_status(const LogPlayerView *view)
 {
     char text[120] = "";
@@ -625,7 +669,8 @@ static void refresh_history_status(const LogPlayerView *view)
     }
 }
 
-// 按数据版本更新文件列表与预览，文件读取由主循环完成。
+// SD 页面刷新入口：读取 LogPlayer 只读视图，更新回放按钮状态、提示及有变化的列表/预览。
+// 回放占用期间限制相关控件，不重新刷新文件窗口；浏览内容按 revision 判断是否需要更新。
 static void refresh_player(void)
 {
     if(playback_page == NULL) return;
@@ -641,6 +686,7 @@ static void refresh_player(void)
         replay->state == LOG_REPLAY_PAUSED ? "Resume" : "Pause");
     for(unsigned i = 0; i < LOG_PLAYER_PAGE_SIZE; i++) lv_obj_set_disabled(file_buttons[i], replay_busy);
     lv_obj_set_disabled(history_filter.input, replay_busy);
+    // 回放状态和提示仍刷新，普通文件列表与预览先保持原窗口，避免无关内存分配和重绘。
     if(replay_busy) {
         lv_obj_set_disabled(delete_button, true);
         lv_obj_set_disabled(frame_previous, true);
@@ -648,6 +694,7 @@ static void refresh_player(void)
         player_display_valid = false;
         return;
     }
+    // 版本相同且已显示过就跳过浏览内容更新，操作提示和回放状态已在前面处理。
     if(player_display_valid && displayed_player_revision == view->revision) return;
     player_display_valid = true;
     displayed_player_revision = view->revision;
@@ -674,6 +721,7 @@ static void refresh_player(void)
     lv_obj_set_disabled(list_next, view->list_state != LOG_LIST_READY ||
         (view->page + 1U) * LOG_PLAYER_PAGE_SIZE >= view->total_files);
 
+    // Match 是筛选结果中的位置；frame 是原文件中的报文序号，二者可能不同。
     if(view->filter_enabled) {
         lv_label_set_text_fmt(preview_count_label, "Match %lu/%lu | frame %lu/%lu",
             (unsigned long)(view->frame_count ? view->first_match + 1U : 0U),
@@ -712,6 +760,7 @@ static void refresh_player(void)
         lv_obj_set_style_text_color(storage_label, lv_color_hex(0xE35B5B), LV_PART_MAIN);
     }
     else lv_label_set_text(storage_label, "Reading capacity...");
+    // 历史表格最多五条预览加表头，只展示窗口，不等于文件总帧数。
     lv_table_set_row_count(preview_table, view->frame_count + 1U);
     for(unsigned i = 0; i < view->frame_count; i++) {
         const CanFrame *frame = &view->frames[i];
@@ -736,6 +785,7 @@ static void refresh_player(void)
     }
 }
 
+// LVGL 文件按钮回调：以按钮实际显示的名称提交打开请求，再刷新界面进度。
 static void file_event_cb(lv_event_t *event)
 {
     // 使用按钮实际显示的文件名，避免目录更新与界面刷新之间选择错误条目。
@@ -743,12 +793,14 @@ static void file_event_cb(lv_event_t *event)
     refresh_player();
 }
 
+// LVGL 文件列表翻页回调：用户数据携带 -1 或 1，提交相邻页请求，不在回调里遍历目录。
 static void history_page_cb(lv_event_t *event)
 {
     LogPlayer_RequestPage((int)(intptr_t)lv_event_get_user_data(event));
     refresh_player();
 }
 
+// LVGL 刷新按钮回调：请求重新扫描首页和容量，不主动归档或清空原日志。
 static void history_refresh_cb(lv_event_t *event)
 {
     (void)event;
@@ -756,6 +808,7 @@ static void history_refresh_cb(lv_event_t *event)
     refresh_player();
 }
 
+// LVGL Apply 回调：关闭键盘并提交历史 ID 筛选，后续文件处理由主循环执行。
 static void history_filter_apply_cb(lv_event_t *event)
 {
     (void)event;
@@ -763,13 +816,15 @@ static void history_filter_apply_cb(lv_event_t *event)
     refresh_filter(&history_filter);
 }
 
+// LVGL 前后帧按钮回调：仅在输入条件已应用时移动匹配窗口，再显示定位状态。
 static void history_step_cb(lv_event_t *event)
 {
     if(history_filter_applied()) LogPlayer_RequestStep((int)(intptr_t)lv_event_get_user_data(event));
     refresh_player();
 }
 
-// 使用本地 LVGL 的绘制任务接口标出当前帧，不为每一行创建独立控件。
+// LVGL 绘制任务事件回调：只修改预览首条数据行的填充颜色，突出当前帧。
+// 行号 0 为表头，1 为第一条记录；不创建额外控件，不修改数据内容。
 static void history_table_draw_cb(lv_event_t *event)
 {
     lv_draw_fill_dsc_t *fill = lv_draw_task_get_fill_dsc(lv_event_get_draw_task(event));
@@ -779,7 +834,8 @@ static void history_table_draw_cb(lv_event_t *event)
     }
 }
 
-// 确认按钮仅提交固定目标的删除请求，文件系统操作由主循环处理。
+// LVGL 删除弹窗回调：用户数据非空表示确认，NULL 表示取消，先关闭弹窗。
+// 确认时提交此前锁定的 delete_target，不重新读取可能变化的选中文件名。
 static void delete_confirm_cb(lv_event_t *event)
 {
     bool confirm = lv_event_get_user_data(event) != NULL;
@@ -791,6 +847,8 @@ static void delete_confirm_cb(lv_event_t *event)
     refresh_player();
 }
 
+// LVGL 删除按钮回调：复制当前目标名并显示顶层确认遮罩，不立即删除文件。
+// 遮罩阻止背景操作；实际删除必须经过确认回调和主循环请求处理。
 static void history_delete_cb(lv_event_t *event)
 {
     (void)event;
@@ -826,6 +884,8 @@ static void history_delete_cb(lv_event_t *event)
     lv_obj_add_event_cb(confirm, delete_confirm_cb, LV_EVENT_CLICKED, delete_target);
 }
 
+// 定时刷新内部调用：读取 main 发布的状态快照，只更新变化的 CAN/SD 状态和累计异常提示。
+// 当前状态与历史错误分别显示；只改变控件，不清除错误计数或恢复外设。
 static void refresh_runtime(void)
 {
     const CanStatsRuntime *runtime = CanStats_GetRuntime();
@@ -858,7 +918,7 @@ static void refresh_runtime(void)
         lv_obj_set_style_text_color(sd_status_label, lv_color_hex(color), LV_PART_MAIN);
     }
 
-    // 屏幕只提示异常类别；累计计数、错误码和耗时由串口诊断提供。
+    // 屏幕只提示异常类别；累计计数和错误码看串口摘要，当前精简版本不输出详细耗时。
     if(!runtime_display_valid || runtime->queue_lost != displayed_runtime.queue_lost ||
        runtime->fifo_overruns != displayed_runtime.fifo_overruns ||
        runtime->error_flags != displayed_runtime.error_flags ||
@@ -875,11 +935,13 @@ static void refresh_runtime(void)
     }
     // 归档结果与接收帧数无关，未收到新报文时仍须更新。
     refresh_archive(runtime);
+    // 保存本次已显示的副本，下次比较变化；不修改业务模块保留的原始状态。
     displayed_runtime = *runtime;
     runtime_display_valid = true;
 }
 
-// 统计刷新主体；仅修改控件，不改变 CAN 接收统计或日志记录。
+// 统一界面刷新主体：先更新运行状态和历史/回放提示，再按新帧计数更新接收显示。
+// 没有新帧时仍处理关闭键盘后的待应用筛选；页面已释放的表格不再使用。
 static void refresh_stats_widgets(void)
 {
     refresh_runtime();
@@ -900,17 +962,17 @@ static void refresh_stats_widgets(void)
     if(receive_filter.table != NULL) refresh_receive(&receive_filter);
 }
 
-// 周期更新页面数据。
+// LVGL 定时器在主循环中调用：刷新统计控件；周期是页面数据更新间隔，不是 CAN 接收周期。
 static void stats_timer_cb(lv_timer_t *timer)
 {
     (void)timer;
     refresh_stats_widgets();
 }
 
-//创建状态栏
+// 启动时建立常驻顶部状态栏，显示 CAN、日志状态和累计帧数，切换业务页时不删除。
 static void create_status_bar(lv_obj_t *screen)
 {
-    //创建状态栏容器并设置位置和尺寸 
+    // 创建状态栏容器并设置位置和尺寸
     lv_obj_t *bar = lv_obj_create(screen);
     lv_obj_set_clickable(bar, false);
     lv_obj_set_scrollable(bar, false);
@@ -921,7 +983,7 @@ static void create_status_bar(lv_obj_t *screen)
     lv_obj_set_style_radius(bar, 0, LV_PART_MAIN);
     lv_obj_set_style_pad_all(bar, 0, LV_PART_MAIN);
 
-    //添加状态栏各状态标签
+    // 添加状态栏各状态标签
     create_label(bar, "CanSight", 16, 12, 100, lv_color_hex(UI_COLOR_TEXT));
     can_status_label = create_label(bar, "● CAN1 未启动", 150, 13, 150,
                                    lv_color_hex(UI_COLOR_MUTED));
@@ -931,7 +993,8 @@ static void create_status_bar(lv_obj_t *screen)
     total_label = create_label(bar, "总帧数 0", 630, 13, 165, lv_color_hex(UI_COLOR_TEXT));
 }
 
-// 处理接收页分页事件。
+// LVGL 接收页翻页回调：非空用户数据表示向后八条，NULL 表示向前八条。
+// 仅改变显示偏移；越界统一由 refresh_receive 回到首页，不改变统计内容。
 static void receive_page_cb(lv_event_t *event)
 {
     // 事件用户数据非空表示下一页，为 NULL 表示上一页。
@@ -945,7 +1008,8 @@ static void receive_page_cb(lv_event_t *event)
     refresh_receive(&receive_filter);
 }
 
-//创建 CAN 接收页面的 UI 组件
+// 页面创建内部调用：建立 ID 输入区和固定八行数据位置，绑定筛选与翻页事件。
+// 接收期间复用单元格并裁剪单行文字，不随每个新 ID 增删表格行。
 static void create_receive_page(lv_obj_t *screen)
 {
     receive_page = lv_obj_create(screen);
@@ -957,7 +1021,7 @@ static void create_receive_page(lv_obj_t *screen)
     lv_obj_set_style_border_width(receive_page, 0, LV_PART_MAIN);
     lv_obj_set_style_pad_all(receive_page, 0, LV_PART_MAIN);
 
-    //筛选区域：ID 输入框、清除按钮、匹配统计
+    // 筛选区域：ID 输入框、清除按钮、匹配统计
     create_label(receive_page, "ID (hex)", 16, 9, 70, lv_color_hex(UI_COLOR_MUTED));
     lv_obj_t *filter = lv_textarea_create(receive_page);
     lv_obj_set_pos(filter, 92, 0);
@@ -1002,6 +1066,8 @@ static void create_receive_page(lv_obj_t *screen)
     bind_filter(&receive_filter, filter, clear, table, matches);
 }
 
+// LVGL 回放按钮回调：用户数据 0 为开始，1 为暂停/继续，其他值为停止。
+// 只提交 LogPlayer 状态请求，界面提示不代表邮箱或文件操作已经完成。
 static void replay_event_cb(lv_event_t *event)
 {
     intptr_t action = (intptr_t)lv_event_get_user_data(event);
@@ -1014,7 +1080,8 @@ static void replay_event_cb(lv_event_t *event)
     refresh_player();
 }
 
-// 创建历史文件管理、逐帧浏览及 CAN 原速回放页面。
+// 页面创建内部调用：建立文件列表、历史筛选、帧导航及回放按钮，绑定相关事件。
+// 最后绑定筛选并首次刷新；不在这里同步读取整份日志，控件在离开页面时释放。
 static void create_playback_page(lv_obj_t *screen)
 {
     playback_page = lv_obj_create(screen);
@@ -1044,6 +1111,7 @@ static void create_playback_page(lv_obj_t *screen)
         lv_label_set_long_mode(label, LV_LABEL_LONG_MODE_DOTS);
         lv_obj_set_width(label, 158);
         lv_obj_set_style_text_align(label, LV_TEXT_ALIGN_LEFT, LV_PART_MAIN);
+        // 绑定静态名称缓冲而不是目录数组下标，点击对象与按钮实际显示名称保持一致。
         lv_obj_add_event_cb(file_buttons[i], file_event_cb, LV_EVENT_CLICKED, file_button_names[i]);
     }
     list_previous = create_button(panel, "<", 4, 165, 36, 28, false);
@@ -1111,9 +1179,11 @@ static void create_playback_page(lv_obj_t *screen)
     refresh_player();
 }
 
+// main 在 LVGL 和显示/输入设备初始化后调用一次：创建常驻区、接收页、复用键盘和定时器。
+// 首次数据刷新立即执行，随后约每 500 ms 更新；SD 页面等用户切换时再建立。
 void ui_init(void)
 {
-    //获取当前活动屏幕并设置背景样式 
+    // 获取当前活动屏幕并设置背景样式
     lv_obj_t *screen = lv_screen_active();
     lv_obj_set_clickable(screen, false);
     lv_obj_set_scrollable(screen, false);
@@ -1121,7 +1191,7 @@ void ui_init(void)
     lv_obj_set_style_bg_opa(screen, LV_OPA_COVER, LV_PART_MAIN);
     lv_obj_set_style_pad_all(screen, 0, LV_PART_MAIN);
 
-    //创建顶部状态栏，显示应用名称和CAN总线状态信息 
+    // 创建顶部状态栏，显示应用名称和CAN总线状态信息
     create_status_bar(screen);
     capacity_label = create_label(screen, "", 16, 100, 770,
                                   lv_color_hex(0xE3B34E));
@@ -1136,12 +1206,13 @@ void ui_init(void)
     lv_obj_add_event_cb(receive_tab, tab_event_cb, LV_EVENT_CLICKED, NULL);
     lv_obj_add_event_cb(playback_tab, tab_event_cb, LV_EVENT_CLICKED, NULL);
 
-    //先只创建当前显示的接收页，回放页在点击页签时再创建
+    // 先只创建当前显示的接收页，回放页在点击页签时再创建
     create_receive_page(screen);
     create_hex_keyboard();  // 在 CAN 启动前完成键盘分配和定位。
 
-    //默认显示接收页面
+    // 默认显示接收页面
     show_page(false);
     stats_timer_cb(NULL);  // 初始化统计显示。
+    // 定时器只有主循环服务 LVGL 时才执行，500 ms 不是独立硬件中断，也不保证高负载下绝不延迟。
     lv_timer_create(stats_timer_cb, 500, NULL);  // 注册周期刷新任务，仅在界面初始化时创建。
 }
